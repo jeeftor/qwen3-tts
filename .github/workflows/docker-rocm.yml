@@ -1,8 +1,9 @@
 name: docker-rocm
 
+# Manual dispatch only — GitHub-hosted runners lack disk for the ~40GB
+# rocm/pytorch base image. Images are built locally on the deployment
+# host instead; this workflow is here for a future self-hosted runner.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
