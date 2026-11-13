@@ -260,6 +260,19 @@ async def voice_studio_page():
     )
 
 
+@app.get("/sw.js")
+async def service_worker():
+    """Service worker at root scope — /static/sw.js could only control /static/."""
+    sw_path = STATIC_DIR / "sw.js"
+    if sw_path.exists():
+        return FileResponse(
+            sw_path, media_type="application/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     """Serve the voice studio as the site root (API info page is at /static/index.html)."""

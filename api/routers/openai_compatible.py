@@ -46,6 +46,14 @@ _gpu_lock = asyncio.Lock()
 _QUEUE_FINAL_STATES = ("done", "error", "cancelled")
 
 
+class QueueFullError(Exception):
+    """Pending queue is at TTS_MAX_QUEUE — reject new submissions."""
+
+
+class DuplicateRequestError(Exception):
+    """X-Request-Id already belongs to a queued/running request."""
+
+
 class SpeechQueue:
     """FIFO queue for GPU-bound speech generation.
 
@@ -54,21 +62,34 @@ class SpeechQueue:
     - a client that disconnects while queued is dropped instead of
       burning a GPU slot later
     - TTS_MAX_CONCURRENT slots are honored in FIFO order
+    - TTS_MAX_QUEUE caps pending requests (QueueFullError when full)
+    - duplicate live request ids are rejected (DuplicateRequestError)
     """
 
     def __init__(self, max_concurrent: int):
         self.max_concurrent = max(1, int(max_concurrent))
+        self.max_queue = max(1, int(os.environ.get("TTS_MAX_QUEUE", "32")))
         self._lock = asyncio.Lock()
         self._pending = collections.deque()        # request_ids waiting for a slot
         self._running = collections.OrderedDict()  # request_id -> entry
         self._entries = {}                         # request_id -> entry (all states)
         self._events = {}                          # request_id -> asyncio.Event
-        self._durations = collections.deque(maxlen=30)
+        # ETA samples bucketed by model+clone-ness; _durations_any is the fallback
+        self._durations = collections.defaultdict(
+            lambda: collections.deque(maxlen=30))
+        self._durations_any = collections.deque(maxlen=30)
 
     async def acquire(self, request_id: str, info: dict) -> None:
         """Register the request and wait for a generation slot (FIFO)."""
         ev = asyncio.Event()
         async with self._lock:
+            existing = self._entries.get(request_id)
+            if existing is not None and existing["state"] in ("queued", "running"):
+                raise DuplicateRequestError(
+                    f"request id '{request_id}' is already {existing['state']}")
+            if len(self._pending) >= self.max_queue:
+                raise QueueFullError(
+                    f"queue full ({self.max_queue} waiting) — retry shortly")
             self._entries[request_id] = {
                 "request_id": request_id,
                 "state": "queued",
@@ -113,7 +134,9 @@ class SpeechQueue:
                 if started:
                     dur = entry["finished_at"] - started
                     entry["duration_seconds"] = round(dur, 2)
-                    self._durations.append(dur)
+                    key = _duration_key(entry)
+                    self._durations[key].append(dur)
+                    self._durations_any.append(dur)
                 self._running.pop(request_id, None)
             self._promote_locked()
             self._gc_locked()
@@ -183,11 +206,19 @@ class SpeechQueue:
             "text_preview": entry.get("text_preview", ""),
             "position": position,
         }
-        if position is not None and self._durations:
-            avg = sum(self._durations) / len(self._durations)
-            ahead = len(self._running) + position - 1
-            out["estimated_wait_seconds"] = round(
-                avg * max(1, -(-ahead // self.max_concurrent)), 1)
+        if position is not None and self._durations_any:
+            # Prefer same model+clone bucket once it has enough samples,
+            # else fall back to the global rolling average.
+            bucket = self._durations.get(_duration_key(entry))
+            samples = (
+                list(bucket) if bucket is not None and len(bucket) >= 3
+                else list(self._durations_any)
+            )
+            if samples:
+                avg = sum(samples) / len(samples)
+                ahead = len(self._running) + position - 1
+                out["estimated_wait_seconds"] = round(
+                    avg * max(1, -(-ahead // self.max_concurrent)), 1)
         return out
 
     def status(self, request_id: Optional[str] = None):
@@ -199,6 +230,7 @@ class SpeechQueue:
         active = [self._public(e) for e in self._running.values()]
         board = {
             "max_concurrent": self.max_concurrent,
+            "max_queue": self.max_queue,
             "active_count": len(active),
             "queue_length": len(queued),
             "active": active,
@@ -219,6 +251,11 @@ class SpeechQueue:
 
 # Serializes all speech generation — TTS_MAX_CONCURRENT slots, FIFO, observable.
 _queue = SpeechQueue(int(os.environ.get("TTS_MAX_CONCURRENT", "1")))
+
+
+def _duration_key(entry: dict) -> str:
+    """ETA bucket: model + clone-ness (empty model = 'auto' → mostly global)."""
+    return f"{entry.get('model') or 'auto'}|{'clone' if entry.get('clone') else 'preset'}"
 
 
 def _request_id(client_request: Request) -> str:
@@ -452,7 +489,13 @@ async def create_speech(
     Pass an X-Request-Id header and poll GET /v1/queue/{id} for position.
     """
     rid = _request_id(client_request)
-    await _queue.acquire(rid, _queue_info(request))
+    try:
+        await _queue.acquire(rid, _queue_info(request))
+    except QueueFullError as e:
+        raise HTTPException(status_code=429, detail=str(e),
+                            headers={"Retry-After": "15"})
+    except DuplicateRequestError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     state = "done"
     try:
         return await _create_speech_impl(request, client_request)
@@ -969,7 +1012,13 @@ async def create_voice_clone(
     Serialized through the same FIFO SpeechQueue as /audio/speech.
     """
     rid = _request_id(client_request)
-    await _queue.acquire(rid, _queue_info(request))
+    try:
+        await _queue.acquire(rid, _queue_info(request))
+    except QueueFullError as e:
+        raise HTTPException(status_code=429, detail=str(e),
+                            headers={"Retry-After": "15"})
+    except DuplicateRequestError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     state = "done"
     try:
         return await _create_voice_clone_impl(request, client_request)

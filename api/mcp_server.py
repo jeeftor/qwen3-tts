@@ -133,7 +133,10 @@ async def generate_speech(
         instruct=instruct or None,
     )
     rid = f"mcp-{uuid.uuid4().hex[:12]}"
-    await oai._queue.acquire(rid, oai._queue_info(req))
+    try:
+        await oai._queue.acquire(rid, oai._queue_info(req))
+    except (oai.QueueFullError, oai.DuplicateRequestError) as e:
+        raise ToolError(str(e))
     state = "done"
     try:
         resp = await oai._create_speech_impl(req, None)
