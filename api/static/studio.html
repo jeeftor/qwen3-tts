@@ -512,6 +512,8 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn{touch-action:manipulation}
         <tr><td><span class="mono">GET·POST·PUT·DELETE</span></td><td><code>/v1/voice-profiles</code></td><td>Voice profile CRUD (+ <code>/{id}/ref-audio</code>)</td></tr>
         <tr><td><span class="mono">GET·POST·PUT·DELETE</span></td><td><code>/v1/clips</code></td><td>Saved clip library (+ <code>/{id}/audio</code>, <code>/stream.mp3</code>, <code>/play</code>)</td></tr>
         <tr><td><span class="mono">GET</span></td><td><code>/v1/speakers</code></td><td>Sonos/media players via Home Assistant</td></tr>
+        <tr><td><span class="mono">GET·DELETE</span></td><td><code>/v1/queue</code> <code>/v1/queue/{id}</code></td><td>Generation queue — position, ETA, cancel queued</td></tr>
+        <tr><td><span class="mono">POST</span></td><td><code>/mcp/</code></td><td>MCP endpoint (streamable HTTP) — tools: generate_speech, list_voices, list_clips, play_clip…</td></tr>
         <tr><td><span class="mono">GET</span></td><td><code>/health</code></td><td>Backend / model / device status</td></tr>
       </table>
     </div>
@@ -738,11 +740,27 @@ async function runGenerate(payload, statusEl, eqId, resultId, audioId) {
   $(resultId).classList.add('hidden');
   const fmt = payload.response_format || 'wav';
   const t0 = Date.now();
+  // Queue tracking: server FIFO — poll position until our slot opens
+  const rid = (crypto.randomUUID ? crypto.randomUUID() : 'r' + Date.now() + Math.random().toString(16).slice(2));
+  const poller = setInterval(() => {
+    fetch('/v1/queue/' + rid).then(r => r.ok ? r.json() : null).then(q => {
+      if (!q || !q.request) return;
+      const s = q.request;
+      if (s.state === 'queued') {
+        status(statusEl, `Queued #${s.position} of ${q.queue_length} waiting` +
+          (s.estimated_wait_seconds ? ` · ~${Math.round(s.estimated_wait_seconds)}s` : ''));
+      } else if (s.state === 'running') {
+        status(statusEl, 'Generating…');
+      }
+    }).catch(() => {});
+  }, 1200);
+  const qHeaders = {'Content-Type':'application/json', 'X-Request-Id': rid};
   try {
     let blob, ext, dlName;
     if (payload.stream && fmt === 'wav') {
       const body = Object.assign({}, payload, {stream:true, response_format:'pcm'});
-      const r = await api('/v1/audio/speech', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), signal: ctl.signal});
+      const r = await api('/v1/audio/speech', {method:'POST', headers:qHeaders, body:JSON.stringify(body), signal: ctl.signal});
+      clearInterval(poller);
       const reader = r.body.getReader(); const chunks=[]; let received=0;
       while (true) {
         const {done, value} = await reader.read();
@@ -756,7 +774,8 @@ async function runGenerate(payload, statusEl, eqId, resultId, audioId) {
       blob = pcmToWavBlob(trimPcmSilence(pcm)); ext = 'wav';
     } else {
       payload.stream = false;
-      const r = await api('/v1/audio/speech', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload), signal: ctl.signal});
+      const r = await api('/v1/audio/speech', {method:'POST', headers:qHeaders, body:JSON.stringify(payload), signal: ctl.signal});
+      clearInterval(poller);
       const ct = r.headers.get('content-type')||'';
       ext = ct.includes('mpeg')?'mp3':ct.includes('flac')?'flac':ct.includes('ogg')?'ogg':ct.includes('opus')?'opus':'wav';
       blob = await r.blob(); prog.value = 100;
@@ -781,7 +800,7 @@ async function runGenerate(payload, statusEl, eqId, resultId, audioId) {
       toast('Generation failed: ' + e.message, 'err');
     }
     return false;
-  } finally { eqOn(eqId, false); prog.remove(); cancelBtn.remove(); }
+  } finally { clearInterval(poller); eqOn(eqId, false); prog.remove(); cancelBtn.remove(); }
 }
 
 function updateStyleBox() {

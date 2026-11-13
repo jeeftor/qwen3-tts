@@ -7,11 +7,13 @@ Implements endpoints compatible with OpenAI's TTS API specification.
 
 import asyncio
 import base64
+import collections
 import io
 import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -40,8 +42,205 @@ router = APIRouter(
 # GPU lock: serializes TTS generation to prevent GPU contention
 # (pattern from groxaxo vllm_omni backend)
 _gpu_lock = asyncio.Lock()
-# Serializes all speech generation — one request at a time (GPU-bound, model swaps are global).
-_speech_sem = asyncio.Semaphore(int(os.environ.get("TTS_MAX_CONCURRENT", "1")))
+
+_QUEUE_FINAL_STATES = ("done", "error", "cancelled")
+
+
+class SpeechQueue:
+    """FIFO queue for GPU-bound speech generation.
+
+    Replaces a bare semaphore so that:
+    - clients can poll queue position/state via /v1/queue endpoints
+    - a client that disconnects while queued is dropped instead of
+      burning a GPU slot later
+    - TTS_MAX_CONCURRENT slots are honored in FIFO order
+    """
+
+    def __init__(self, max_concurrent: int):
+        self.max_concurrent = max(1, int(max_concurrent))
+        self._lock = asyncio.Lock()
+        self._pending = collections.deque()        # request_ids waiting for a slot
+        self._running = collections.OrderedDict()  # request_id -> entry
+        self._entries = {}                         # request_id -> entry (all states)
+        self._events = {}                          # request_id -> asyncio.Event
+        self._durations = collections.deque(maxlen=30)
+
+    async def acquire(self, request_id: str, info: dict) -> None:
+        """Register the request and wait for a generation slot (FIFO)."""
+        ev = asyncio.Event()
+        async with self._lock:
+            self._entries[request_id] = {
+                "request_id": request_id,
+                "state": "queued",
+                "submitted_at": time.time(),
+                **info,
+            }
+            self._pending.append(request_id)
+            self._events[request_id] = ev
+            self._promote_locked()
+            self._gc_locked()
+        try:
+            await ev.wait()
+        except asyncio.CancelledError:
+            # Client went away while queued — drop the ticket so it never runs.
+            await self._drop_if_queued(request_id, "cancelled")
+            raise
+        if self._entries.get(request_id, {}).get("state") == "cancelled":
+            # Explicitly cancelled via DELETE /v1/queue/{id} while queued.
+            raise asyncio.CancelledError()
+
+    def _promote_locked(self) -> None:
+        while len(self._running) < self.max_concurrent and self._pending:
+            rid = self._pending.popleft()
+            entry = self._entries.get(rid)
+            if entry is None or entry["state"] != "queued":
+                continue
+            entry["state"] = "running"
+            entry["started_at"] = time.time()
+            self._running[rid] = entry
+            ev = self._events.pop(rid, None)
+            if ev is not None:
+                ev.set()
+
+    async def release(self, request_id: str, state: str = "done") -> None:
+        """Free the slot and promote the next queued request."""
+        async with self._lock:
+            entry = self._entries.get(request_id)
+            if entry is not None:
+                entry["state"] = state if state in _QUEUE_FINAL_STATES else "done"
+                entry["finished_at"] = time.time()
+                started = entry.get("started_at")
+                if started:
+                    dur = entry["finished_at"] - started
+                    entry["duration_seconds"] = round(dur, 2)
+                    self._durations.append(dur)
+                self._running.pop(request_id, None)
+            self._promote_locked()
+            self._gc_locked()
+
+    async def _drop_if_queued(self, request_id: str, state: str) -> None:
+        async with self._lock:
+            entry = self._entries.get(request_id)
+            if entry is not None and entry["state"] == "queued":
+                entry["state"] = state
+                entry["finished_at"] = time.time()
+                try:
+                    self._pending.remove(request_id)
+                except ValueError:
+                    pass
+                self._events.pop(request_id, None)
+
+    async def cancel(self, request_id: str):
+        """Cancel a queued request. Returns 'cancelled', 'running' (cannot
+        stop in-flight GPU work), or None if unknown."""
+        async with self._lock:
+            entry = self._entries.get(request_id)
+            if entry is None:
+                return None
+            if entry["state"] == "queued":
+                entry["state"] = "cancelled"
+                entry["finished_at"] = time.time()
+                try:
+                    self._pending.remove(request_id)
+                except ValueError:
+                    pass
+                ev = self._events.pop(request_id, None)
+                if ev is not None:
+                    ev.set()  # wake the waiter; acquire() sees 'cancelled'
+                return "cancelled"
+            return "running" if entry["state"] == "running" else entry["state"]
+
+    def _gc_locked(self) -> None:
+        now = time.time()
+        stale = [
+            rid for rid, e in self._entries.items()
+            if e["state"] in _QUEUE_FINAL_STATES
+            and e.get("finished_at") and now - e["finished_at"] > 300
+        ]
+        for rid in stale:
+            self._entries.pop(rid, None)
+            self._events.pop(rid, None)
+        while len(self._entries) > 500:
+            rid = next(iter(self._entries))
+            if self._entries[rid]["state"] in _QUEUE_FINAL_STATES:
+                self._entries.pop(rid, None)
+                self._events.pop(rid, None)
+            else:
+                break
+
+    def _public(self, entry: dict, position: Optional[int] = None) -> dict:
+        out = {
+            "request_id": entry["request_id"],
+            "state": entry["state"],
+            "submitted_at": entry.get("submitted_at"),
+            "started_at": entry.get("started_at"),
+            "finished_at": entry.get("finished_at"),
+            "duration_seconds": entry.get("duration_seconds"),
+            "voice": entry.get("voice", ""),
+            "model": entry.get("model", ""),
+            "response_format": entry.get("response_format", ""),
+            "stream": entry.get("stream", False),
+            "text_preview": entry.get("text_preview", ""),
+            "position": position,
+        }
+        if position is not None and self._durations:
+            avg = sum(self._durations) / len(self._durations)
+            ahead = len(self._running) + position - 1
+            out["estimated_wait_seconds"] = round(
+                avg * max(1, -(-ahead // self.max_concurrent)), 1)
+        return out
+
+    def status(self, request_id: Optional[str] = None):
+        positions = {rid: i + 1 for i, rid in enumerate(self._pending)}
+        queued = [
+            self._public(self._entries[rid], positions[rid])
+            for rid in self._pending if rid in self._entries
+        ]
+        active = [self._public(e) for e in self._running.values()]
+        board = {
+            "max_concurrent": self.max_concurrent,
+            "active_count": len(active),
+            "queue_length": len(queued),
+            "active": active,
+            "queued": queued,
+        }
+        if request_id is None:
+            return board
+        entry = self._entries.get(request_id)
+        if entry is None:
+            return None
+        return {
+            **board,
+            "request": self._public(
+                entry, positions.get(request_id)
+                if entry["state"] == "queued" else None),
+        }
+
+
+# Serializes all speech generation — TTS_MAX_CONCURRENT slots, FIFO, observable.
+_queue = SpeechQueue(int(os.environ.get("TTS_MAX_CONCURRENT", "1")))
+
+
+def _request_id(client_request: Request) -> str:
+    """Client-supplied X-Request-Id (sanitized) or a fresh uuid."""
+    rid = "".join(
+        c for c in client_request.headers.get("x-request-id", "")
+        if c.isalnum() or c in "-_."
+    )[:64]
+    return rid or uuid.uuid4().hex
+
+
+def _queue_info(request) -> dict:
+    voice = getattr(request, "voice", "") or ""
+    return {
+        "voice": voice,
+        "model": getattr(request, "model", "") or "",
+        "response_format": getattr(request, "response_format", "") or "",
+        "stream": bool(getattr(request, "stream", False)),
+        "text_preview": (getattr(request, "input", "") or "")[:80],
+        "clone": voice.lower().startswith("clone:")
+        or getattr(request, "task_type", None) == "Base",
+    }
 
 # Voice library directory (same as VOICE_LIBRARY_DIR in start_server.sh)
 VOICE_LIBRARY_DIR = Path(os.environ.get("VOICE_LIBRARY_DIR", "./voice_library")).resolve()
@@ -247,9 +446,24 @@ async def create_speech(
     request: OpenAISpeechRequest,
     client_request: Request,
 ):
-    """OpenAI-compatible endpoint for text-to-speech. Serialized via _speech_sem."""
-    async with _speech_sem:
+    """OpenAI-compatible endpoint for text-to-speech.
+
+    Serialized through the FIFO SpeechQueue (TTS_MAX_CONCURRENT slots).
+    Pass an X-Request-Id header and poll GET /v1/queue/{id} for position.
+    """
+    rid = _request_id(client_request)
+    await _queue.acquire(rid, _queue_info(request))
+    state = "done"
+    try:
         return await _create_speech_impl(request, client_request)
+    except asyncio.CancelledError:
+        state = "cancelled"
+        raise
+    except Exception:
+        state = "error"
+        raise
+    finally:
+        await _queue.release(rid, state)
 
 
 async def _create_speech_impl(
@@ -590,6 +804,37 @@ async def _create_speech_impl(
         )
 
 
+# ---------------------------------------------------------------------------
+# Generation queue status (clients poll with their X-Request-Id)
+# ---------------------------------------------------------------------------
+
+@router.get("/queue")
+async def get_queue():
+    """Queue board: currently running + waiting generation requests."""
+    return _queue.status()
+
+
+@router.get("/queue/{request_id}")
+async def get_queue_request(request_id: str):
+    """Status of one request: queued (with position + ETA) / running / done."""
+    st = _queue.status(request_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Unknown request_id"})
+    return st
+
+
+@router.delete("/queue/{request_id}")
+async def cancel_queue_request(request_id: str):
+    """Cancel a still-queued request. Running requests cannot be stopped —
+    in-flight GPU work always runs to completion."""
+    result = await _queue.cancel(request_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Unknown request_id"})
+    if result == "running":
+        raise HTTPException(status_code=409, detail={"error": "already_running", "message": "Request is already generating — cannot cancel in-flight GPU work"})
+    return {"request_id": request_id, "state": "cancelled"}
+
+
 @router.get("/models")
 async def list_models():
     """List all available TTS models."""
@@ -719,9 +964,23 @@ async def create_voice_clone(
     request: VoiceCloneRequest,
     client_request: Request,
 ):
-    """Clone a voice from reference audio and generate speech. Serialized via _speech_sem."""
-    async with _speech_sem:
+    """Clone a voice from reference audio and generate speech.
+
+    Serialized through the same FIFO SpeechQueue as /audio/speech.
+    """
+    rid = _request_id(client_request)
+    await _queue.acquire(rid, _queue_info(request))
+    state = "done"
+    try:
         return await _create_voice_clone_impl(request, client_request)
+    except asyncio.CancelledError:
+        state = "cancelled"
+        raise
+    except Exception:
+        state = "error"
+        raise
+    finally:
+        await _queue.release(rid, state)
 
 
 async def _create_voice_clone_impl(
@@ -1295,6 +1554,8 @@ async def delete_clip(clip_id: str):
 
 import httpx
 
+_mp3_transcode_lock = asyncio.Lock()
+
 HA_URL = os.environ.get("TTS_HA_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("TTS_HA_TOKEN", "")
 # Base URL speakers use to fetch clip audio — must be LAN-reachable, no auth
@@ -1358,13 +1619,20 @@ async def get_clip_mp3(clip_id: str):
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Clip audio missing"})
     mp3_path = cdir / "play.mp3"
     if not mp3_path.exists():
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", str(src), "-codec:a", "libmp3lame", "-q:a", "4",
-            str(mp3_path),
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        await proc.wait()
-        if proc.returncode != 0 or not mp3_path.exists():
-            raise HTTPException(status_code=500, detail={"error": "transcode_failed", "message": "ffmpeg mp3 transcode failed"})
+        # Serialize transcodes — two concurrent requests for the same clip
+        # would otherwise race writing play.mp3.
+        async with _mp3_transcode_lock:
+            if not mp3_path.exists():
+                tmp_path = mp3_path.with_suffix(".mp3.tmp")
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", str(src), "-codec:a", "libmp3lame", "-q:a", "4",
+                    str(tmp_path),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await proc.wait()
+                if proc.returncode != 0 or not tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+                    raise HTTPException(status_code=500, detail={"error": "transcode_failed", "message": "ffmpeg mp3 transcode failed"})
+                tmp_path.replace(mp3_path)
     return FileResponse(str(mp3_path), media_type="audio/mpeg",
                         filename=f"{meta.get('name', clip_id)}.mp3")
 

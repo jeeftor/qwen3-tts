@@ -46,8 +46,18 @@ and [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streaming
   reference audio (first run downloads the model).
 - **Style suggestions** — `POST /v1/style-suggest` asks a Lemonade LLM
   (`LEMONADE_URL`, `LEMONADE_MODEL`) for a style instruction from a vibe.
-- **Request serialization** — `TTS_MAX_CONCURRENT` (default 1) caps
-  concurrent GPU generations so requests queue instead of racing model state.
+- **Request queue** — `TTS_MAX_CONCURRENT` (default 1) caps concurrent GPU
+  generations as a FIFO queue. Clients pass an `X-Request-Id` header on
+  `/v1/audio/speech` and poll `GET /v1/queue/{id}` for position + ETA;
+  `GET /v1/queue` shows the whole board and `DELETE /v1/queue/{id}` cancels
+  a still-queued request. Disconnecting while queued drops the ticket so it
+  never burns a GPU slot. The Studio UI shows live queue position.
+- **MCP endpoint** — with the `mcp` package installed, a Model Context
+  Protocol server is mounted at `/mcp/` (streamable HTTP). Tools:
+  `generate_speech` (returns base64 audio, optional `save_clip`),
+  `list_models`, `list_voices`, `list_voice_profiles`, `list_clips`,
+  `list_speakers`, `queue_status`, `suggest_style`, `play_clip`.
+  MCP generations go through the same queue as REST/UI requests.
 
 See `.env.example` for all optional integration variables and
 `voice_library/README.md` for the on-disk data layout.

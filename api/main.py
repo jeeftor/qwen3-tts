@@ -53,6 +53,16 @@ VOICE_LIBRARY_DIR = Path(os.getenv("VOICE_LIBRARY_DIR", "./voice_library")).reso
 # Get the directory containing static files
 STATIC_DIR = Path(__file__).parent / "static"
 
+# MCP (Model Context Protocol) endpoint — optional, requires `mcp` package.
+MCP_AVAILABLE = False
+_mcp_session_manager = None
+try:
+    from .mcp_server import mcp as _mcp
+    _mcp_session_manager = _mcp.session_manager
+    MCP_AVAILABLE = True
+except ImportError as e:
+    logger.info(f"MCP endpoint disabled (mcp package not installed): {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -114,12 +124,29 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"GPU keepalive setup failed: {e}")
 
-    yield
+    # MCP streamable-HTTP session manager (mounted sub-app lifespans don't
+    # run, so the parent lifespan owns it — per MCP SDK docs pattern)
+    mcp_ctx = None
+    if _mcp_session_manager is not None:
+        try:
+            mcp_ctx = _mcp_session_manager.run()
+            await mcp_ctx.__aenter__()
+        except Exception as e:
+            logger.warning(f"MCP session manager failed to start: {e}")
+            mcp_ctx = None
 
-    # Cleanup
-    if keepalive_task:
-        keepalive_task.cancel()
-    logger.info("Server shutting down...")
+    try:
+        yield
+    finally:
+        if mcp_ctx is not None:
+            try:
+                await mcp_ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+        # Cleanup
+        if keepalive_task:
+            keepalive_task.cancel()
+        logger.info("Server shutting down...")
 
 
 # Initialize FastAPI app
@@ -170,6 +197,15 @@ app.add_middleware(
 # Include routers
 from .routers.openai_compatible import router as openai_router
 app.include_router(openai_router, prefix="/v1")
+
+# Mount MCP endpoint (streamable HTTP at /mcp/) when the mcp package is present
+if MCP_AVAILABLE:
+    try:
+        from .mcp_server import mcp as _mcp_app
+        app.mount("/mcp", _mcp_app.streamable_http_app())
+        logger.info("MCP endpoint mounted at /mcp/")
+    except Exception as e:
+        logger.warning(f"Failed to mount MCP endpoint: {e}")
 
 # Mount static files if directory exists
 if STATIC_DIR.exists():
