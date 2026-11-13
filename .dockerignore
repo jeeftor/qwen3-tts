@@ -1,0 +1,28 @@
+# Never bake local data, secrets, or VCS data into the image
+.git
+.gitignore
+.dockerignore
+.env
+.env.*
+
+# Runtime data — mounted as volumes at deploy time, NOT image content
+voice_library/
+models/
+data/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Docs/CI not needed at runtime
+.github/
+*.md
+!LICENSE
+
+# OS/editor noise
+.DS_Store
+*.swp
