@@ -54,14 +54,18 @@ VOICE_LIBRARY_DIR = Path(os.getenv("VOICE_LIBRARY_DIR", "./voice_library")).reso
 STATIC_DIR = Path(__file__).parent / "static"
 
 # MCP (Model Context Protocol) endpoint — optional, requires `mcp` package.
+# streamable_http_app() must be called before .session_manager is accessible
+# (the session manager is created lazily by the SDK).
 MCP_AVAILABLE = False
+_mcp_http_app = None
 _mcp_session_manager = None
 try:
     from .mcp_server import mcp as _mcp
+    _mcp_http_app = _mcp.streamable_http_app()
     _mcp_session_manager = _mcp.session_manager
     MCP_AVAILABLE = True
-except ImportError as e:
-    logger.info(f"MCP endpoint disabled (mcp package not installed): {e}")
+except Exception as e:
+    logger.info(f"MCP endpoint disabled: {e}")
 
 
 @asynccontextmanager
@@ -201,8 +205,7 @@ app.include_router(openai_router, prefix="/v1")
 # Mount MCP endpoint (streamable HTTP at /mcp/) when the mcp package is present
 if MCP_AVAILABLE:
     try:
-        from .mcp_server import mcp as _mcp_app
-        app.mount("/mcp", _mcp_app.streamable_http_app())
+        app.mount("/mcp", _mcp_http_app)
         logger.info("MCP endpoint mounted at /mcp/")
     except Exception as e:
         logger.warning(f"Failed to mount MCP endpoint: {e}")

@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "qwen3-tts",
+    # mounted at /mcp by main.py — the sub-app's internal route is "/"
+    streamable_http_path="/",
     instructions=(
         "Qwen3-TTS text-to-speech server. Generate speech with preset or "
         "cloned voices (voice='clone:<profile name>'), browse voice profiles "
