@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir uv
 # build and would clobber the base image's ROCm torch). The base image
 # already ships matching versions, so this is nearly a no-op; it also
 # covers torchvision/torchaudio/triton explicitly.
-RUN uv pip install --system --break-system-packages --no-cache --no-index \
+RUN uv pip install --python /opt/venv/bin/python --no-cache --no-index \
     --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/ \
     torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton==3.6.0
 
@@ -33,13 +33,13 @@ COPY requirements.txt .
 # requirements.txt keeps unpinned torch>=2.4.0 for the CUDA Dockerfile —
 # skip torch* lines here (base image + pin above already provide them).
 RUN grep -v '^torch' requirements.txt > /tmp/reqs-rocm.txt \
-    && uv pip install --system --break-system-packages --no-cache -r /tmp/reqs-rocm.txt
+    && uv pip install --python /opt/venv/bin/python --no-cache -r /tmp/reqs-rocm.txt
 
 # Install flash attention (AMD Triton path — built from source)
 RUN cd /tmp && \
     git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention && \
-    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE uv pip install --system --break-system-packages --no-cache --no-build-isolation . && \
+    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE uv pip install --python /opt/venv/bin/python --no-cache --no-build-isolation . && \
     cd / && rm -rf /tmp/flash-attention
 
 # Copy application code (includes qwen_tts/ with streaming patches applied)
@@ -48,15 +48,15 @@ COPY . .
 # Install the package (makes qwen_tts importable).
 # torch/torchvision/torchaudio/triton are already satisfied by the ROCm
 # pin above, so the resolver won't touch them.
-RUN uv pip install --system --break-system-packages --no-cache -e .
+RUN uv pip install --python /opt/venv/bin/python --no-cache -e .
 
 # Belt-and-suspenders: force the exact ROCm build if anything slipped through.
-RUN uv pip install --system --break-system-packages --no-cache --no-index \
+RUN uv pip install --python /opt/venv/bin/python --no-cache --no-index \
     --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/ \
     torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton==3.6.0
 
 # Voice Studio (Gradio UI at /voice-studio) — local addition, not upstream
-RUN uv pip install --system --break-system-packages --no-cache gradio faster-whisper
+RUN uv pip install --python /opt/venv/bin/python --no-cache gradio faster-whisper
 
 # Default config location
 RUN mkdir -p /root/qwen3-tts/voice_library
