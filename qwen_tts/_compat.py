@@ -1,11 +1,17 @@
 # coding=utf-8
 # SPDX-License-Identifier: Apache-2.0
-"""Compatibility shims for running the vendored 4.x-era model code on
-transformers>=5. Imported first by ``qwen_tts/__init__.py`` — keep this
-module side-effect-only and free of qwen_tts imports (it must run before
-the modeling modules are defined)."""
+"""Compatibility shims bridging the vendored model code and the
+installed transformers version (mask-fn kwargs, config defaults, RoPE
+init lookup, Mimi checkpoint conversion). Imported first by
+``qwen_tts/__init__.py`` — keep this module side-effect-only and free of
+qwen_tts imports (it must run before the modeling modules are
+defined)."""
+
+import functools
+import inspect
 
 import torch
+import transformers.masking_utils as _masking_utils
 from transformers import PretrainedConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
@@ -70,16 +76,66 @@ def get_rope_init_fn(rope_type: str):
 # renamed and the audio encoder silently loads with random weights
 # (clone prompts become garbage and generation never emits EOS).
 # Register the same mapping under our class name.
-from transformers.conversion_mapping import (
-    get_checkpoint_conversion_mapping,
-    register_checkpoint_conversion_mapping,
-)
+try:
+    from transformers.conversion_mapping import (
+        get_checkpoint_conversion_mapping,
+        register_checkpoint_conversion_mapping,
+    )
 
-_mimi_conversion = get_checkpoint_conversion_mapping("MimiModel")
-if _mimi_conversion is not None:
-    try:
-        register_checkpoint_conversion_mapping(
-            "Qwen3TTSTokenizerV2Encoder", _mimi_conversion
-        )
-    except ValueError:
-        pass  # already registered (module reload)
+    _mimi_conversion = get_checkpoint_conversion_mapping("MimiModel")
+    if _mimi_conversion is not None:
+        try:
+            register_checkpoint_conversion_mapping(
+                "Qwen3TTSTokenizerV2Encoder", _mimi_conversion
+            )
+        except ValueError:
+            pass  # already registered (module reload)
+except ImportError:
+    pass  # transformers<5 has no conversion_mapping; not needed there
+
+
+# transformers 5.x renamed the mask-fn embed kwarg input_embeds ->
+# inputs_embeds and made cache_position optional; 4.x requires
+# input_embeds and a positional cache_position. The vendored code calls
+# the 5.x spelling everywhere, so wrap both spellings into whichever
+# signature the installed transformers provides. Patching the module
+# attribute works because the modeling modules do
+# ``from transformers.masking_utils import ...`` only after this module
+# has run (qwen_tts/__init__ imports _compat first).
+def _adapt_mask_fn(fn):
+    params = inspect.signature(fn).parameters
+    uses_inputs_embeds = "inputs_embeds" in params
+    needs_cache_position = (
+        "cache_position" in params
+        and params["cache_position"].default is inspect.Parameter.empty
+    )
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not uses_inputs_embeds and "inputs_embeds" in kwargs:
+            kwargs["input_embeds"] = kwargs.pop("inputs_embeds")
+        if needs_cache_position and "cache_position" not in kwargs:
+            embeds = kwargs.get("input_embeds", kwargs.get("inputs_embeds"))
+            past_key_values = kwargs.get("past_key_values")
+            past = (
+                past_key_values.get_seq_length()
+                if past_key_values is not None
+                else 0
+            )
+            qlen = embeds.shape[1] if embeds is not None else 1
+            kwargs["cache_position"] = torch.arange(
+                past,
+                past + qlen,
+                device=embeds.device if embeds is not None else None,
+            )
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+for _mask_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+    _mask_fn = getattr(_masking_utils, _mask_name, None)
+    if _mask_fn is not None and not getattr(_mask_fn, "_qwen_compat", False):
+        _wrapped = _adapt_mask_fn(_mask_fn)
+        _wrapped._qwen_compat = True
+        setattr(_masking_utils, _mask_name, _wrapped)

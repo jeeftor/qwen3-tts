@@ -17,7 +17,7 @@ ffmpeg-python>=0.2.0
 # TTS model — transformers pinned to match pyproject.toml (the -e
 # install runs --no-deps, so this file is the only place these resolve)
 torch>=2.4.0
-transformers==5.22.2
+transformers==4.57.1
 accelerate>=1.15.0
 
 # pyproject deps not covered above or by the ROCm base image
