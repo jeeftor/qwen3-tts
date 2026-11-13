@@ -18,6 +18,11 @@ ffmpeg-python>=0.2.0
 # install runs --no-deps, so this file is the only place these resolve)
 torch>=2.4.0
 transformers==4.57.1
+# transformers 4.57.1 requires tokenizers<=0.23.0 and hub<1.0 — pin them
+# so the later `gradio` install can't drag in incompatible majors
+# (gradio is installed with `gradio<6` in the Dockerfile for the same reason)
+tokenizers==0.22.2
+huggingface-hub==0.36.2
 accelerate>=1.15.0
 
 # pyproject deps not covered above or by the ROCm base image

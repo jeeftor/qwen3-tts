@@ -60,7 +60,8 @@ RUN uv pip install --python /opt/venv/bin/python --no-cache --no-index \
     torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton==3.6.0
 
 # Voice Studio (Gradio UI at /voice-studio) — local addition, not upstream
-RUN uv pip install --python /opt/venv/bin/python --no-cache gradio faster-whisper
+# gradio<6: gradio 6 requires huggingface-hub>=2 which breaks transformers 4.x
+RUN uv pip install --python /opt/venv/bin/python --no-cache "gradio<6" faster-whisper
 
 # Default config location
 RUN mkdir -p /root/qwen3-tts/voice_library
