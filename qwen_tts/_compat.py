@@ -59,3 +59,27 @@ def get_rope_init_fn(rope_type: str):
     if rope_type == "default":
         return _compute_default_rope_parameters_compat
     return ROPE_INIT_FUNCTIONS[rope_type]
+
+
+# transformers>=5 nests MimiModel's encoder/decoder halves
+# (MimiEncoderModel/MimiDecoderModel) and ships checkpoint key-renaming
+# conversions for the old flat layout — but only registered under the
+# native class name "MimiModel". Our tokenizer encoder is a custom
+# subclass, which the loader skips as custom code, so the flat-layout
+# keys (encoder.layers.*, encoder_transformer.*, downsample.*) never get
+# renamed and the audio encoder silently loads with random weights
+# (clone prompts become garbage and generation never emits EOS).
+# Register the same mapping under our class name.
+from transformers.conversion_mapping import (
+    get_checkpoint_conversion_mapping,
+    register_checkpoint_conversion_mapping,
+)
+
+_mimi_conversion = get_checkpoint_conversion_mapping("MimiModel")
+if _mimi_conversion is not None:
+    try:
+        register_checkpoint_conversion_mapping(
+            "Qwen3TTSTokenizerV2Encoder", _mimi_conversion
+        )
+    except ValueError:
+        pass  # already registered (module reload)
