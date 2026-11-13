@@ -16,30 +16,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libsndfile1 git \
     && rm -rf /var/lib/apt/lists/*
 
-# Python dependencies
+# uv — much faster resolver/installer than pip for the wheel-heavy steps below
+RUN pip install --no-cache-dir uv
+
+# Python dependencies.
+# The ROCm torch stack is installed FIRST so nothing below can pull the
+# CUDA wheels from PyPI (unpinned torch/torchaudio resolve to the CUDA
+# build and would clobber the base image's ROCm torch). The base image
+# already ships matching versions, so this is nearly a no-op; it also
+# covers torchvision/torchaudio/triton explicitly.
+RUN uv pip install --system --no-cache --no-index \
+    --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/ \
+    torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton==3.6.0
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# requirements.txt keeps unpinned torch>=2.4.0 for the CUDA Dockerfile —
+# skip torch* lines here (base image + pin above already provide them).
+RUN grep -v '^torch' requirements.txt > /tmp/reqs-rocm.txt \
+    && uv pip install --system --no-cache -r /tmp/reqs-rocm.txt
 
 # Install flash attention (AMD Triton path — built from source)
 RUN cd /tmp && \
     git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention && \
-    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE pip install . --no-build-isolation && \
+    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE uv pip install --system --no-cache --no-build-isolation . && \
     cd / && rm -rf /tmp/flash-attention
 
 # Copy application code (includes qwen_tts/ with streaming patches applied)
 COPY . .
 
-# Install the package (makes qwen_tts importable)
-RUN pip install --no-cache-dir -e .
+# Install the package (makes qwen_tts importable).
+# torch/torchvision/torchaudio/triton are already satisfied by the ROCm
+# pin above, so the resolver won't touch them.
+RUN uv pip install --system --no-cache -e .
 
-# requirements.txt has unpinned torch>=2.4.0 — pip resolves the CUDA build
-# from PyPI and clobbers the ROCm torch shipped in the base image.
-# Reinstall the matching ROCm 7.2.4 stack from the PyTorch ROCm index.
-RUN pip install --no-cache-dir --no-index     --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/     --prefer-binary     torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton==3.6.0
+# Belt-and-suspenders: force the exact ROCm build if anything slipped through.
+RUN uv pip install --system --no-cache --no-index \
+    --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/ \
+    torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton==3.6.0
 
 # Voice Studio (Gradio UI at /voice-studio) — local addition, not upstream
-RUN pip install --no-cache-dir gradio faster-whisper
+RUN uv pip install --system --no-cache gradio faster-whisper
 
 # Default config location
 RUN mkdir -p /root/qwen3-tts/voice_library
