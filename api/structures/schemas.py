@@ -154,6 +154,10 @@ class VoiceCloneRequest(BaseModel):
         le=4.0,
         description="The speed of the generated audio. Select a value from 0.25 to 4.0.",
     )
+    model: Optional[str] = Field(
+        default=None,
+        description="Optional model override — a config.yaml model key such as '0.6B-Base' or '1.7B-Base'. Defaults to the server's clone_model setting.",
+    )
     task_type: Optional[str] = Field(
         default=None,
         description="Task type: CustomVoice, VoiceDesign, or Base (for voice cloning).",

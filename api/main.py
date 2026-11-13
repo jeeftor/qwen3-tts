@@ -194,17 +194,38 @@ if ENABLE_VOICE_STUDIO:
             base_url = f"http://{voice_studio_host}:{PORT}"
             voice_studio_app = build_app(base_url, VOICE_LIBRARY_DIR)
 
-            # Mount the Gradio app
-            app = gr.mount_gradio_app(app, voice_studio_app, path="/voice-studio")
-            logger.info(f"Voice Studio mounted at /voice-studio")
+            # Mount the Gradio app (legacy fallback — primary UI is studio.html)
+            app = gr.mount_gradio_app(app, voice_studio_app, path="/voice-studio-legacy")
+            logger.info(f"Voice Studio (legacy) mounted at /voice-studio-legacy")
         except Exception as e:
             logger.warning(f"Failed to mount Voice Studio: {e}")
             logger.info("Voice Studio can still be run separately with 'qwen-tts-voice-studio'")
 
 
+# Custom single-page voice studio — shipped in api/static/, with a
+# voice_library/studio.html override for bind-mounted deployments.
+STUDIO_HTML_CANDIDATES = [
+    STATIC_DIR / "studio.html",
+    VOICE_LIBRARY_DIR / "studio.html",
+]
+STUDIO_HTML = next((p for p in STUDIO_HTML_CANDIDATES if p.exists()), STUDIO_HTML_CANDIDATES[0])
+
+
+@app.get("/voice-studio", response_class=HTMLResponse)
+async def voice_studio_page():
+    if STUDIO_HTML.exists():
+        return HTMLResponse(STUDIO_HTML.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        "<h1>Voice studio UI missing</h1><p>Expected studio.html in the voice library directory.</p>",
+        status_code=503,
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    """Serve the main web interface."""
+    """Serve the voice studio as the site root (API info page is at /static/index.html)."""
+    if STUDIO_HTML.exists():
+        return HTMLResponse(STUDIO_HTML.read_text(encoding="utf-8"))
     index_path = STATIC_DIR / "index.html"
     if index_path.exists():
         return FileResponse(index_path)

@@ -22,3 +22,11 @@ wheels/
 .vscode/
 venv/
 env/
+# Runtime data — voice profiles, clips, models (not source code)
+voice_library/*
+!voice_library/README.md
+models/
+*.ckpt
+.env
+.env.*
+!.env.example

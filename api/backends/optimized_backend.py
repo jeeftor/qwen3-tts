@@ -43,6 +43,8 @@ class OptimizedQwen3TTSBackend:
 
     def _get_model_key_for_request(self, openai_model: str) -> str:
         """Map OpenAI model name to our model key."""
+        if openai_model in self.config.get("models", {}):
+            return openai_model
         if openai_model in MODEL_MAPPING:
             return MODEL_MAPPING[openai_model]
         base_model = openai_model.rsplit('-', 1)[0] if '-' in openai_model else openai_model
@@ -110,21 +112,29 @@ class OptimizedQwen3TTSBackend:
                 attn_implementation="sdpa",
             )
 
-        # torch.compile — config.yaml params, following dffdeeq examples exactly
-        if opt.get("use_compile", True) and self.device != "cpu":
-            try:
-                streaming_opts = opt.get("streaming", {})
-                self.model.enable_streaming_optimizations(
-                    decode_window_frames=streaming_opts.get("decode_window_frames", 80),
-                    use_compile=True,
-                    use_cuda_graphs=opt.get("use_cuda_graphs", False),
-                    compile_mode=opt.get("compile_mode", "max-autotune"),
-                    use_fast_codebook=opt.get("use_fast_codebook", True),
-                    compile_codebook_predictor=opt.get("compile_codebook_predictor", True),
-                    compile_talker=opt.get("compile_talker", False),
-                )
-                logger.info(f"torch.compile enabled: mode={opt.get('compile_mode', 'max-autotune')}, fast_codebook={opt.get('use_fast_codebook', True)}")
+        # Streaming optimizations — fast codebook + decode-window config apply
+        # with or without torch.compile. Compile is impractical on ROCm
+        # (warmup takes tens of minutes), so use_compile=false keeps the cheap wins.
+        use_compile = bool(opt.get("use_compile", True)) and self.device != "cpu"
+        try:
+            streaming_opts = opt.get("streaming", {})
+            self.model.enable_streaming_optimizations(
+                decode_window_frames=streaming_opts.get("decode_window_frames", 80),
+                use_compile=use_compile,
+                use_cuda_graphs=opt.get("use_cuda_graphs", False) and use_compile,
+                compile_mode=opt.get("compile_mode", "max-autotune"),
+                use_fast_codebook=opt.get("use_fast_codebook", True),
+                compile_codebook_predictor=opt.get("compile_codebook_predictor", True),
+            )
+            logger.info(f"Streaming optimizations: compile={use_compile}, mode={opt.get('compile_mode', 'max-autotune')}, fast_codebook={opt.get('use_fast_codebook', True)}")
+        except Exception as e:
+            logger.warning(f"Could not enable streaming optimizations: {e}")
+            use_compile = False
 
+        # torch.compile warmup — only when compilation is enabled; it exists
+        # to trigger lazy kernel compilation (very slow on ROCm).
+        if use_compile:
+            try:
                 # Mandatory warmup — dffdeeq examples ALWAYS run a generation
                 # right after enable_streaming_optimizations() to trigger
                 # actual kernel compilation (torch.compile is lazy).
@@ -249,6 +259,8 @@ class OptimizedQwen3TTSBackend:
     ) -> Tuple[np.ndarray, int]:
         """Generate speech, switching model if needed."""
         model_key = self._get_model_key_for_request(model)
+        if self.config.get("models", {}).get(model_key, {}).get("type") != "customvoice":
+            model_key = MODEL_MAPPING.get(model, "0.6B-CustomVoice")
         await self._ensure_model_loaded(model_key)
 
         wavs, sr = self.model.generate_custom_voice(
@@ -283,6 +295,8 @@ class OptimizedQwen3TTSBackend:
         Uses dffdeeq's stream_generate_pcm under the hood.
         """
         model_key = self._get_model_key_for_request(model)
+        if self.config.get("models", {}).get(model_key, {}).get("type") != "customvoice":
+            model_key = MODEL_MAPPING.get(model, "0.6B-CustomVoice")
         await self._ensure_model_loaded(model_key)
 
         streaming_opts = self.config.get("optimization", {}).get("streaming", {})
@@ -308,6 +322,13 @@ class OptimizedQwen3TTSBackend:
             yield chunk, sr
 
 
+    def _clone_model_key(self, model: Optional[str]) -> str:
+        """Resolve clone checkpoint: explicit Base-type config key wins, else clone_model."""
+        models_cfg = self.config.get("models", {})
+        if model and models_cfg.get(model, {}).get("type") == "base":
+            return model
+        return self.config.get("clone_model", "1.7B-Base")
+
     async def generate_voice_clone(
         self,
         text: str,
@@ -318,9 +339,10 @@ class OptimizedQwen3TTSBackend:
         x_vector_only_mode: bool = False,
         speed: float = 1.0,
         cache_key: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> Tuple[np.ndarray, int]:
         """Voice cloning requires Base model."""
-        await self._ensure_model_loaded("0.6B-Base")
+        await self._ensure_model_loaded(self._clone_model_key(model))
 
         import time as _time
 
@@ -379,12 +401,13 @@ class OptimizedQwen3TTSBackend:
         language: str = "Auto",
         x_vector_only_mode: bool = False,
         cache_key: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Streaming voice cloning via dffdeeq stream_generate_voice_clone.
 
         Yields (pcm_chunk, sample_rate) tuples as audio is generated.
         """
-        await self._ensure_model_loaded("0.6B-Base")
+        await self._ensure_model_loaded(self._clone_model_key(model))
 
         import time as _time
 
