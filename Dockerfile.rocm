@@ -35,11 +35,13 @@ COPY requirements.txt .
 RUN grep -v '^torch' requirements.txt > /tmp/reqs-rocm.txt \
     && uv pip install --python /opt/venv/bin/python --no-cache -r /tmp/reqs-rocm.txt
 
-# Install flash attention (AMD Triton path — built from source)
+# Install flash attention (AMD Triton path — built from source).
+# --no-deps: the ROCm base image's triton dist-info is malformed and
+# breaks uv's resolver; torch+triton are already present anyway.
 RUN cd /tmp && \
     git clone https://github.com/Dao-AILab/flash-attention.git && \
     cd flash-attention && \
-    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE uv pip install --python /opt/venv/bin/python --no-cache --no-build-isolation . && \
+    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE uv pip install --python /opt/venv/bin/python --no-cache --no-build-isolation --no-deps . && \
     cd / && rm -rf /tmp/flash-attention
 
 # Copy application code (includes qwen_tts/ with streaming patches applied)
