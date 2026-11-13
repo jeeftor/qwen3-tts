@@ -14,10 +14,17 @@ numpy>=1.24.0
 pydub>=0.25.0
 ffmpeg-python>=0.2.0
 
-# TTS model
+# TTS model — transformers pinned to match pyproject.toml (the -e
+# install runs --no-deps, so this file is the only place these resolve)
 torch>=2.4.0
-transformers>=5.10.0
+transformers==5.22.2
 accelerate>=1.15.0
+
+# pyproject deps not covered above or by the ROCm base image
+# (needed because `uv pip install -e .` runs with --no-deps)
+sox
+onnxruntime
+einops
 
 # Config
 pyyaml>=6.0

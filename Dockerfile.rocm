@@ -48,9 +48,11 @@ RUN cd /tmp && \
 COPY . .
 
 # Install the package (makes qwen_tts importable).
-# torch/torchvision/torchaudio/triton are already satisfied by the ROCm
-# pin above, so the resolver won't touch them.
-RUN uv pip install --python /opt/venv/bin/python --no-cache -e .
+# --no-deps: every runtime dep is already covered by requirements.txt,
+# the ROCm torch stack, or the gradio/faster-whisper step below. Letting
+# the resolver see pyproject's loose torch-family constraints pulls the
+# CUDA wheels from PyPI all over again.
+RUN uv pip install --python /opt/venv/bin/python --no-cache --no-deps -e .
 
 # Belt-and-suspenders: force the exact ROCm build if anything slipped through.
 RUN uv pip install --python /opt/venv/bin/python --no-cache --no-index \
