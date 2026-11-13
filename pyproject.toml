@@ -24,7 +24,9 @@ dependencies = [
   "accelerate==1.15.0",
   "gradio",
   "librosa",
-  "torchaudio",
+  # pinned to match the ROCm torch 2.10 stack — unpinned torchaudio
+  # resolves to latest, which drags in CUDA torch + nvidia wheels
+  "torchaudio==2.10.0",
   "soundfile",
   "sox",
   "onnxruntime",
