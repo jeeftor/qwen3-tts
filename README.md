@@ -25,6 +25,34 @@ and [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streaming
   See [`install/pipecat/`](install/pipecat/).
 
 
+## Voice Studio, clips & speaker playback
+
+- **Studio UI** — a self-contained single-page app served at `/` and
+  `/voice-studio` (`api/static/studio.html`). Speak with preset or cloned
+  voices, clone new voices from uploaded/recorded reference audio with
+  optional Whisper transcription, browse profiles, and manage saved clips.
+  The legacy Gradio UI remains at `/voice-studio-legacy`.
+- **Clip library** — `POST/GET/PUT/DELETE /v1/clips` persists generated
+  audio with name/tags/text/voice/model metadata under
+  `voice_library/clips/`. `GET /v1/clips/{id}/audio` streams it,
+  `GET /v1/clips/{id}/stream.mp3` serves a cached MP3 for players that
+  require a file extension.
+- **Speaker playback** — with `TTS_HA_URL` + `TTS_HA_TOKEN` (Home
+  Assistant) and `TTS_PUBLIC_URL` (LAN-reachable base URL for clip audio),
+  `GET /v1/speakers` lists Sonos `media_player` entities and
+  `POST /v1/clips/{id}/play` plays a clip on one or more speakers.
+  All three are optional — endpoints return 503 `not_configured` when unset.
+- **Transcription** — `POST /v1/transcribe` runs faster-whisper on
+  reference audio (first run downloads the model).
+- **Style suggestions** — `POST /v1/style-suggest` asks a Lemonade LLM
+  (`LEMONADE_URL`, `LEMONADE_MODEL`) for a style instruction from a vibe.
+- **Request serialization** — `TTS_MAX_CONCURRENT` (default 1) caps
+  concurrent GPU generations so requests queue instead of racing model state.
+
+See `.env.example` for all optional integration variables and
+`voice_library/README.md` for the on-disk data layout.
+
+
 ## Compatibility
 
 | Platform | Status |
