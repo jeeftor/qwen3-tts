@@ -16,8 +16,8 @@ ffmpeg-python>=0.2.0
 
 # TTS model
 torch>=2.4.0
-transformers>=4.46.0
-accelerate>=0.25.0
+transformers>=5.10.0
+accelerate>=1.15.0
 
 # Config
 pyyaml>=6.0
