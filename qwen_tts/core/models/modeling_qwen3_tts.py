@@ -38,6 +38,7 @@ from transformers.modeling_outputs import (BaseModelOutputWithPast,
                                            CausalLMOutputWithPast, ModelOutput)
 from transformers.modeling_rope_utils import (ROPE_INIT_FUNCTIONS,
                                               dynamic_rope_update)
+from ..._compat import get_rope_init_fn  # transformers>=5: "default" rope type
 from transformers.modeling_utils import (ALL_ATTENTION_FUNCTIONS,
                                          PreTrainedModel)
 from transformers.processing_utils import Unpack
@@ -609,7 +610,7 @@ class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = get_rope_init_fn(self.rope_type)
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -644,7 +645,7 @@ class Qwen3TTSRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = get_rope_init_fn(self.rope_type)
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)

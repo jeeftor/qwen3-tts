@@ -26,16 +26,23 @@ PretrainedConfig.__init__ = _pretrained_config_init_compat
 
 
 # transformers>=5 removed "default" from ROPE_INIT_FUNCTIONS (each model
-# now supplies its own default impl). The vendored RoPE classes index the
-# dict unconditionally — restore the 4.x entry verbatim.
+# now supplies its own compute_default_rope_parameters). The vendored RoPE
+# classes index the dict unconditionally — resolve "default" to the 4.x
+# implementation here instead of mutating the shared dict (which would
+# shadow transformers' own per-module default during weight init).
 def _compute_default_rope_parameters_compat(
     config=None, device=None, seq_len=None, **kwargs
 ):
-    base = config.rope_theta
-    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-    head_dim = getattr(config, "head_dim", None) or (
-        config.hidden_size // config.num_attention_heads
+    rope_params = getattr(config, "rope_parameters", None) or {}
+    base = getattr(config, "rope_theta", None) or rope_params.get(
+        "rope_theta", 10000.0
     )
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+    if partial_rotary_factor is None:
+        partial_rotary_factor = rope_params.get("partial_rotary_factor", 1.0)
+    head_dim = getattr(config, "head_dim", None) or rope_params.get("head_dim")
+    if head_dim is None:
+        head_dim = config.hidden_size // config.num_attention_heads
     dim = int(head_dim * partial_rotary_factor)
     inv_freq = 1.0 / (
         base
@@ -48,4 +55,7 @@ def _compute_default_rope_parameters_compat(
     return inv_freq, 1.0
 
 
-ROPE_INIT_FUNCTIONS.setdefault("default", _compute_default_rope_parameters_compat)
+def get_rope_init_fn(rope_type: str):
+    if rope_type == "default":
+        return _compute_default_rope_parameters_compat
+    return ROPE_INIT_FUNCTIONS[rope_type]

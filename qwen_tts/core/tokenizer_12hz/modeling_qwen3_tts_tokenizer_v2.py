@@ -35,6 +35,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from ..._compat import get_rope_init_fn  # transformers>=5: "default" rope type
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
@@ -256,7 +257,7 @@ class Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = get_rope_init_fn(self.rope_type)
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -1081,6 +1082,25 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
 
 class Qwen3TTSTokenizerV2Encoder(MimiModel):
+    # transformers>=5's MimiModel defines read-only `upsample`/`downsample`/
+    # `encoder_transformer`/`decoder_transformer` properties; restore
+    # settable plain attributes (4.x semantics).
+    @property
+    def upsample(self):
+        return getattr(self, "_upsample", None)
+
+    @upsample.setter
+    def upsample(self, value):
+        object.__setattr__(self, "_upsample", value)
+
+    @property
+    def decoder_transformer(self):
+        return getattr(self, "_decoder_transformer", None)
+
+    @decoder_transformer.setter
+    def decoder_transformer(self, value):
+        object.__setattr__(self, "_decoder_transformer", value)
+
     def __init__(self, config: MimiConfig):
         super().__init__(config)
         self.config = config
