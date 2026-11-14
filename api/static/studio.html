@@ -188,6 +188,13 @@ audio.mini{height:32px;width:200px;margin:0}
 .badge.clone{background:rgba(94,234,212,.1);color:var(--accent2);border-color:rgba(94,234,212,.3)}
 .vcard .acts{display:flex;gap:6px;margin-top:10px}
 .vcard .acts .btn.small{flex:1;justify-content:center}
+/* dictate button + guided-phrase box */
+.dictrow{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.dictrow label{margin-bottom:0}
+#gDictBtn.live{border-color:var(--danger);color:var(--danger)}
+.guide-phrase{font-size:14px;line-height:1.6;color:var(--text);background:var(--bg2);
+  border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin:10px 0;
+  font-style:italic}
 /* clip cards: name/duration + all icon actions on one line */
 .vcard.clip .top{flex-wrap:nowrap;gap:4px}
 .vcard.clip .nm{flex:0 1 auto;min-width:0}
@@ -376,8 +383,11 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
         <label for="gVoice">Voice</label>
         <select id="gVoice"></select>
       </div>
-      <div style="margin-top:14px">
+      <div class="dictrow">
         <label for="gText">Text <span class="hint">— Ctrl+Enter to generate</span></label>
+        <button class="btn ghost small" id="gDictBtn" title="Speak instead of type — transcribed by Whisper">🎤 Dictate</button>
+      </div>
+      <div style="margin-top:14px">
         <textarea id="gText" rows="4">Hello! This is a test of the Qwen3-TTS voice studio.</textarea>
         <div class="charcount"><span id="gCount">0</span> chars</div>
       </div>
@@ -459,6 +469,13 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
     <div class="card">
       <h2>Clone a voice</h2>
       <div class="desc">Record or upload 10–30s of clean speech — one speaker, no music. The clone quality lives or dies on the reference.</div>
+      <details class="adv" id="cGuide">
+        <summary>🎙️ Don't know what to say? Read this phrase <span class="hint">~20s · covers all English sounds</span></summary>
+        <div class="in">
+          <div class="guide-phrase" id="cGuideText"></div>
+          <label class="check"><input type="checkbox" id="cGuideCheck"> I read this phrase — use it as the transcript (skips Whisper)</label>
+        </div>
+      </details>
       <div>
         <label>Reference audio</label>
         <div class="dropzone" id="cDrop">
@@ -909,6 +926,45 @@ $('gSuggest').onclick = async () => {
   finally { $('gSuggest').disabled = false; }
 };
 
+// ---------- guided clone phrase (~20s, broad phoneme coverage) ----------
+const GUIDE_PHRASE = "After the morning meeting, Sarah suggested we walk along the river. The autumn leaves crunched beneath our feet while we talked about plans for the holidays ahead.";
+$('cGuideText').textContent = GUIDE_PHRASE;
+
+// ---------- dictate into the Speak textarea (MediaRecorder → Whisper) ----------
+let dictRec = null, dictChunks = [], dictStream = null;
+$('gDictBtn').onclick = async () => {
+  if (dictRec && dictRec.state === 'recording') { dictRec.stop(); return; }
+  try {
+    dictStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    dictRec = new MediaRecorder(dictStream);
+    dictChunks = [];
+    dictRec.ondataavailable = e => dictChunks.push(e.data);
+    dictRec.onstop = async () => {
+      dictStream.getTracks().forEach(t=>t.stop());
+      $('gDictBtn').classList.remove('live'); $('gDictBtn').textContent = '🎤 Dictate';
+      status($('gStatus'), 'Transcribing…');
+      try {
+        const info = await toWav24k(new Blob(dictChunks));
+        const r = await api('/v1/transcribe', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({audio: info.dataURI, audio_mime:'audio/wav'})});
+        const d = await r.json();
+        const txt = (d.text || '').trim();
+        if (txt) {
+          const cur = $('gText').value;
+          $('gText').value = cur ? cur.replace(/\s+$/, '') + ' ' + txt : txt;
+          $('gText').dispatchEvent(new Event('input'));
+          status($('gStatus'), `Heard: "${txt.slice(0,60)}${txt.length>60?'…':''}"`, 'ok');
+        } else {
+          status($('gStatus'), 'No speech detected', 'err');
+        }
+      } catch(e) { status($('gStatus'), 'Transcribe failed: '+e.message, 'err'); }
+    };
+    dictRec.start();
+    $('gDictBtn').classList.add('live'); $('gDictBtn').textContent = '⏹ Stop';
+    status($('gStatus'), 'Listening… tap Stop when done');
+  } catch(e) { status($('gStatus'), 'Mic access denied: '+e.message, 'err'); }
+};
+
 // ---------- clone: dropzone / record / transcribe ----------
 const drop = $('cDrop'), fileInput = $('cFile');
 drop.onclick = () => fileInput.click();
@@ -944,9 +1000,16 @@ $('cRecBtn').onclick = async () => {
         const info = await toWav24k(new Blob(recChunks));
         info.blobUrl = URL.createObjectURL(info.blob);
         setRefAudio(info, 'microphone');
-        status($('cStatus'), `Recorded ${info.duration.toFixed(1)}s — ready`, 'ok');
-        // mobile-friendly flow: auto-transcribe so the only step left is Save
-        if (!$('cXvec').checked && !$('cText').value.trim()) $('cTranscribe').click();
+        if ($('cGuideCheck').checked) {
+          // guided phrase: we know exactly what was read — skip Whisper
+          $('cText').value = GUIDE_PHRASE;
+          $('cText').dispatchEvent(new Event('input'));
+          status($('cStatus'), `Recorded ${info.duration.toFixed(1)}s — transcript filled from guided phrase`, 'ok');
+        } else {
+          status($('cStatus'), `Recorded ${info.duration.toFixed(1)}s — ready`, 'ok');
+          // mobile-friendly flow: auto-transcribe so the only step left is Save
+          if (!$('cXvec').checked && !$('cText').value.trim()) $('cTranscribe').click();
+        }
       } catch(e) { status($('cStatus'), 'Could not decode recording: '+e.message, 'err'); }
     };
     mediaRec.start();
@@ -1407,6 +1470,18 @@ const syncAdv = () => { gAdv.open = advMq.matches; };
 syncAdv();
 if (advMq.addEventListener) advMq.addEventListener('change', syncAdv);
 else advMq.addListener(syncAdv);
+
+// Web Share Target: shared text arrives as ?text=/?title=/?url= on the PWA
+const _sp = new URLSearchParams(location.search);
+const _shared = (_sp.get('text') || '').trim() ||
+  [_sp.get('title'), _sp.get('url')].filter(Boolean).join('\n').trim();
+if (_shared) {
+  $('gText').value = _shared;
+  $('gText').dispatchEvent(new Event('input'));
+  switchTab('speak');
+  toast('Shared text loaded — hit Generate');
+  history.replaceState(null, '', location.pathname + location.hash);
+}
 
 updateStyleBox();
 loadVoices(); loadProfiles(); loadClips(); checkHealth();
