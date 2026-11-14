@@ -469,27 +469,38 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
     <div class="card">
       <h2>Clone a voice</h2>
       <div class="desc">Record or upload 10–30s of clean speech — one speaker, no music. The clone quality lives or dies on the reference.</div>
-      <details class="adv" id="cGuide">
-        <summary>🎙️ Don't know what to say? Read this phrase <span class="hint">~20s · covers all English sounds</span></summary>
-        <div class="in">
-          <div class="guide-phrase" id="cGuideText"></div>
-          <label class="check"><input type="checkbox" id="cGuideCheck"> I read this phrase — use it as the transcript (skips Whisper)</label>
-        </div>
-      </details>
-      <div>
-        <label>Reference audio</label>
-        <div class="dropzone" id="cDrop">
-          <div class="icons">🎙️</div>
-          <div class="big">Tap to browse or drop audio here</div>
-          <div class="small">WAV / MP3 / M4A / OGG — converted to 24kHz mono automatically</div>
-          <input type="file" id="cFile" accept="audio/*" class="hidden">
-        </div>
-        <div class="recrow">
-          <button class="recbtn" id="cRecBtn"><span class="pulse"></span><span class="timer" id="cRecTime">0:00</span><span id="cRecLabel">● Record</span></button>
-          <span class="kv" id="cAudioInfo"></span>
-        </div>
-        <audio id="cPreview" controls class="hidden" style="margin-top:10px"></audio>
+      <div class="seg" id="cModeSeg" style="margin-bottom:14px">
+        <button data-v="rec" class="on">🎙 Record</button>
+        <button data-v="up">📁 Upload file</button>
       </div>
+      <div id="cRecPane">
+        <details class="adv" id="cGuide" open>
+          <summary>🎙️ Don't know what to say? Read this phrase <span class="hint">~20s · covers all English sounds</span></summary>
+          <div class="in">
+            <div class="guide-phrase" id="cGuideText"></div>
+            <label class="check"><input type="checkbox" id="cGuideCheck"> I read this phrase — use it as the transcript (skips Whisper)</label>
+          </div>
+        </details>
+        <div>
+          <label>Reference audio</label>
+          <div class="recrow" style="margin-top:0">
+            <button class="recbtn" id="cRecBtn"><span class="pulse"></span><span class="timer" id="cRecTime">0:00</span><span id="cRecLabel">● Record</span></button>
+            <span class="kv" id="cAudioInfo"></span>
+          </div>
+        </div>
+      </div>
+      <div id="cUpPane" class="hidden">
+        <div>
+          <label>Reference audio</label>
+          <div class="dropzone" id="cDrop">
+            <div class="icons">🎙️</div>
+            <div class="big">Tap to browse or drop audio here</div>
+            <div class="small">WAV / MP3 / M4A / OGG — converted to 24kHz mono automatically</div>
+            <input type="file" id="cFile" accept="audio/*" class="hidden">
+          </div>
+        </div>
+      </div>
+      <audio id="cPreview" controls class="hidden" style="margin-top:10px"></audio>
       <div style="margin-top:14px">
         <label for="cText">Transcript <span class="hint">— exact words; errors make the clone babble the reference</span></label>
         <textarea id="cText" class="tall" rows="6" placeholder="Paste transcript, or hit Transcribe once audio is loaded"></textarea>
@@ -747,6 +758,10 @@ function segInit(id, get, set) {
 let curModel = '', curFormat = 'wav';
 segInit('gModelSeg', null, v => curModel = v);
 segInit('gFormatSeg', null, v => curFormat = v);
+segInit('cModeSeg', null, v => {
+  $('cRecPane').classList.toggle('hidden', v !== 'rec');
+  $('cUpPane').classList.toggle('hidden', v !== 'up');
+});
 
 // ---------- char counts ----------
 $('gText').oninput = () => $('gCount').textContent = $('gText').value.length;
