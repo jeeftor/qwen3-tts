@@ -195,6 +195,14 @@ audio.mini{height:32px;width:200px;margin:0}
 .guide-phrase{font-size:14px;line-height:1.6;color:var(--text);background:var(--bg2);
   border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin:10px 0;
   font-style:italic}
+.guide-carousel{display:flex;align-items:stretch;gap:8px}
+.guide-carousel .guide-phrase{flex:1;margin:0}
+.garr{flex:0 0 38px;border:1px solid var(--border);border-radius:10px;background:var(--bg2);
+  color:var(--text);font-size:20px;line-height:1;cursor:pointer;touch-action:manipulation}
+.garr:active{border-color:var(--accent);color:var(--accent)}
+.gdots{display:flex;gap:6px;justify-content:center;padding:8px 0 2px}
+.gdots i{width:7px;height:7px;border-radius:50%;background:var(--border);display:block;transition:.15s}
+.gdots i.on{background:var(--accent);transform:scale(1.25)}
 /* clip cards: name/duration + all icon actions on one line */
 .vcard.clip .top{flex-wrap:nowrap;gap:4px}
 .vcard.clip .nm{flex:0 1 auto;min-width:0}
@@ -475,9 +483,14 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
       </div>
       <div id="cRecPane">
         <details class="adv" id="cGuide" open>
-          <summary>🎙️ Don't know what to say? Read this phrase <span class="hint">~20s · covers all English sounds</span></summary>
+          <summary>🎙️ Don't know what to say? Read a phrase <span class="hint">4 options · ~20s · swipe</span></summary>
           <div class="in">
-            <div class="guide-phrase" id="cGuideText"></div>
+            <div class="guide-carousel">
+              <button type="button" class="garr" id="cGuidePrev" aria-label="Previous phrase">‹</button>
+              <div class="guide-phrase" id="cGuideText"></div>
+              <button type="button" class="garr" id="cGuideNext" aria-label="Next phrase">›</button>
+            </div>
+            <div class="gdots" id="cGuideDots"></div>
             <label class="check"><input type="checkbox" id="cGuideCheck"> I read this phrase — use it as the transcript (skips Whisper)</label>
           </div>
         </details>
@@ -941,9 +954,37 @@ $('gSuggest').onclick = async () => {
   finally { $('gSuggest').disabled = false; }
 };
 
-// ---------- guided clone phrase (~20s, broad phoneme coverage) ----------
-const GUIDE_PHRASE = "After the morning meeting, Sarah suggested we walk along the river. The autumn leaves crunched beneath our feet while we talked about plans for the holidays ahead.";
-$('cGuideText').textContent = GUIDE_PHRASE;
+// ---------- guided clone phrases (~20s each, broad phoneme coverage) ----------
+const GUIDE_PHRASES = [
+  "After the morning meeting, Sarah suggested we walk along the river. The autumn leaves crunched beneath our feet while we talked about plans for the holidays ahead.",
+  "Well, I'll be honest — I wasn't sure this would work, but here we are! Three weeks of preparation, one broken laptop, and somehow it all came together beautifully.",
+  "The quarterly review is scheduled for Tuesday, March 4th at half past two in conference room B. Please bring your laptop, a charger, and roughly twenty pages of notes.",
+  "The technician carefully calibrated the spectrometer while explaining how each wavelength corresponded to a different element hidden within the sample."
+];
+let guideIdx = 0;
+function setGuidePhrase(i) {
+  guideIdx = (i + GUIDE_PHRASES.length) % GUIDE_PHRASES.length;
+  $('cGuideText').textContent = GUIDE_PHRASES[guideIdx];
+  $('cGuideDots').innerHTML = GUIDE_PHRASES.map((_,j) => `<i class="${j===guideIdx?'on':''}"></i>`).join('');
+  // switching phrases invalidates a known transcript — clear it
+  if (GUIDE_PHRASES.includes($('cText').value.trim())) {
+    $('cText').value = ''; $('cText').dispatchEvent(new Event('input'));
+  }
+  $('cGuideCheck').checked = false;
+}
+$('cGuidePrev').onclick = () => setGuidePhrase(guideIdx - 1);
+$('cGuideNext').onclick = () => setGuidePhrase(guideIdx + 1);
+(function(){
+  const box = $('cGuideText').parentElement;
+  let sx = null;
+  box.addEventListener('touchstart', e => { sx = e.target.closest('.garr') ? null : e.touches[0].clientX; }, {passive:true});
+  box.addEventListener('touchend', e => {
+    if (sx === null) return;
+    const dx = e.changedTouches[0].clientX - sx; sx = null;
+    if (Math.abs(dx) > 40) setGuidePhrase(guideIdx + (dx < 0 ? 1 : -1));
+  }, {passive:true});
+})();
+setGuidePhrase(0);
 
 // ---------- dictate into the Speak textarea (MediaRecorder → Whisper) ----------
 let dictRec = null, dictChunks = [], dictStream = null;
@@ -1017,7 +1058,7 @@ $('cRecBtn').onclick = async () => {
         setRefAudio(info, 'microphone');
         if ($('cGuideCheck').checked) {
           // guided phrase: we know exactly what was read — skip Whisper
-          $('cText').value = GUIDE_PHRASE;
+          $('cText').value = GUIDE_PHRASES[guideIdx];
           $('cText').dispatchEvent(new Event('input'));
           status($('cStatus'), `Recorded ${info.duration.toFixed(1)}s — transcript filled from guided phrase`, 'ok');
         } else {
