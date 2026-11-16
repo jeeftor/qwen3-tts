@@ -42,10 +42,6 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
-# GPU lock: serializes TTS generation to prevent GPU contention
-# (pattern from groxaxo vllm_omni backend)
-_gpu_lock = asyncio.Lock()
-
 _QUEUE_FINAL_STATES = ("done", "error", "cancelled")
 
 
@@ -288,6 +284,47 @@ VOICE_LIBRARY_DIR = Path(os.environ.get("VOICE_LIBRARY_DIR", "./voice_library"))
 # Cache for reference audio reads (profile_name -> (audio, sr))
 _ref_audio_cache = {}
 
+# Profile index: avoids re-scanning + re-reading every meta.json on each
+# clone request. TTL-based so out-of-band edits still get picked up;
+# CRUD endpoints call _invalidate_profile_index() for instant freshness.
+_profile_index = {"at": 0.0, "by_id": {}, "by_name": {}}
+_PROFILE_INDEX_TTL = 60.0
+
+
+def _profile_index_build() -> tuple:
+    by_id, by_name = {}, {}
+    profiles_dir = VOICE_LIBRARY_DIR / "profiles"
+    if profiles_dir.exists():
+        for child in profiles_dir.iterdir():
+            if not child.is_dir():
+                continue
+            meta_file = child / "meta.json"
+            if not meta_file.exists():
+                continue
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            pid = meta.get("profile_id") or child.name
+            by_id[pid] = (child, meta)
+            nm = (meta.get("name") or "").lower()
+            if nm:
+                by_name[nm] = (child, meta)
+    return by_id, by_name
+
+
+def _get_profile_index():
+    import time
+    now = time.time()
+    if now - _profile_index["at"] > _PROFILE_INDEX_TTL:
+        by_id, by_name = _profile_index_build()
+        _profile_index.update(at=now, by_id=by_id, by_name=by_name)
+    return _profile_index
+
+
+def _invalidate_profile_index():
+    _profile_index["at"] = 0.0
+
 
 def _load_voice_profile(name_or_id: str) -> dict:
     """Load a voice profile by name or profile_id from the voice library.
@@ -299,37 +336,26 @@ def _load_voice_profile(name_or_id: str) -> dict:
     if not profiles_dir.exists():
         raise ValueError(f"Voice library not found: {profiles_dir}")
 
-    # Search all profiles
-    for child in profiles_dir.iterdir():
-        if not child.is_dir():
-            continue
-        meta_file = child / "meta.json"
-        if not meta_file.exists():
-            continue
-        try:
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+    idx = _get_profile_index()
+    hit = idx["by_id"].get(name_or_id) or idx["by_name"].get(name_or_id.lower())
+    if not hit:
+        raise ValueError(f"Voice profile not found: '{name_or_id}'")
+    child, meta = hit
 
-        # Match by profile_id or name (case-insensitive)
-        if meta.get("profile_id") == name_or_id or \
-           meta.get("name", "").lower() == name_or_id.lower():
-            # Found it -- build result
-            ref_filename = meta.get("ref_audio_filename", "")
-            if not ref_filename:
-                raise ValueError(f"Profile '{name_or_id}' has no reference audio")
-            ref_path = child / ref_filename
-            if not ref_path.exists():
-                raise ValueError(f"Reference audio missing: {ref_path}")
-            return {
-                "ref_audio_path": str(ref_path),
-                "ref_text": meta.get("ref_text", ""),
-                "x_vector_only_mode": meta.get("x_vector_only_mode", False),
-                "language": meta.get("language", "Auto"),
-                "name": meta.get("name", name_or_id),
-            }
-
-    raise ValueError(f"Voice profile not found: '{name_or_id}'")
+    # Found it -- build result
+    ref_filename = meta.get("ref_audio_filename", "")
+    if not ref_filename:
+        raise ValueError(f"Profile '{name_or_id}' has no reference audio")
+    ref_path = child / ref_filename
+    if not ref_path.exists():
+        raise ValueError(f"Reference audio missing: {ref_path}")
+    return {
+        "ref_audio_path": str(ref_path),
+        "ref_text": meta.get("ref_text", ""),
+        "x_vector_only_mode": meta.get("x_vector_only_mode", False),
+        "language": meta.get("language", "Auto"),
+        "name": meta.get("name", name_or_id),
+    }
 
 
 # Language code to language name mapping
@@ -804,22 +830,16 @@ async def _create_speech_impl(
                 },
             )
         else:
-            # Non-streaming: generate in thread pool to keep event loop free
-            # GPU lock serializes access (pattern from groxaxo vllm_omni backend)
-            async with _gpu_lock:
-                gen_start = time.time()
-                loop = asyncio.get_event_loop()
-                audio, sample_rate = await loop.run_in_executor(
-                    None,
-                    lambda: asyncio.run(generate_speech(
-                        text=normalized_text,
-                        voice=request.voice,
-                        language=language,
-                        instruct=request.instruct,
-                        speed=request.speed,
-                    ))
-                )
-                gen_time = time.time() - gen_start
+            # Non-streaming: backend runs GPU work on its own thread, event loop stays free
+            gen_start = time.time()
+            audio, sample_rate = await generate_speech(
+                text=normalized_text,
+                voice=request.voice,
+                language=language,
+                instruct=request.instruct,
+                speed=request.speed,
+            )
+            gen_time = time.time() - gen_start
 
             audio_dur = len(audio) / sample_rate if sample_rate > 0 else 0
             rtf = gen_time / audio_dur if audio_dur > 0 else 0
@@ -1139,19 +1159,9 @@ def _find_profile_dir(name_or_id: str) -> Optional[Path]:
     """Locate a profile directory by profile_id or name (case-insensitive)."""
     if not PROFILES_DIR.exists():
         return None
-    for child in PROFILES_DIR.iterdir():
-        if not child.is_dir():
-            continue
-        meta_file = child / "meta.json"
-        if not meta_file.exists():
-            continue
-        try:
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if meta.get("profile_id") == name_or_id or meta.get("name", "").lower() == name_or_id.lower():
-            return child
-    return None
+    idx = _get_profile_index()
+    hit = idx["by_id"].get(name_or_id) or idx["by_name"].get(name_or_id.lower())
+    return hit[0] if hit else None
 
 
 def _profile_public(meta: dict, pid: str) -> dict:
@@ -1269,6 +1279,7 @@ async def create_voice_profile(body: dict):
     }
     (pdir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     _ref_audio_cache.pop(name, None)
+    _invalidate_profile_index()
     return {"profile": _profile_public(meta, pid)}
 
 
@@ -1307,6 +1318,7 @@ async def update_voice_profile(profile_id: str, body: dict):
     meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     _ref_audio_cache.pop(old_name, None)
     _ref_audio_cache.pop(meta.get("name", ""), None)
+    _invalidate_profile_index()
     return {"profile": _profile_public(meta, pdir.name)}
 
 
@@ -1322,6 +1334,7 @@ async def delete_voice_profile(profile_id: str):
     except Exception:
         pass
     shutil.rmtree(pdir)
+    _invalidate_profile_index()
     return {"deleted": True, "profile_id": pdir.name}
 
 
@@ -1371,9 +1384,8 @@ async def transcribe_audio(body: dict):
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": "invalid_input", "message": f"Bad audio payload: {e}"})
 
-    import tempfile
+    mime = body.get("audio_mime", "") or "audio/wav"
     suffix = ".wav"
-    mime = body.get("audio_mime", "")
     if "mpeg" in mime or "mp3" in mime:
         suffix = ".mp3"
     elif "ogg" in mime or "opus" in mime:
@@ -1381,6 +1393,27 @@ async def transcribe_audio(body: dict):
     elif "webm" in mime:
         suffix = ".webm"
 
+    # Preferred path: Lemonade whisper.cpp (large-v3-turbo) — much faster
+    # and more accurate than the in-container faster-whisper fallback.
+    lemonade_url = os.environ.get("LEMONADE_URL", "").rstrip("/")
+    if lemonade_url:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{lemonade_url}/v1/audio/transcriptions",
+                    files={"file": (f"audio{suffix}", audio_bytes, mime)},
+                    data={"model": os.environ.get("LEMONADE_TRANSCRIBE_MODEL", "Whisper-Large-v3-Turbo")},
+                )
+                resp.raise_for_status()
+                result = resp.json()
+            text = (result.get("text") or "").strip()
+            if text:
+                return {"text": text, "segments": result.get("segments") or [], "language": result.get("language")}
+        except Exception as e:
+            logger.warning(f"Lemonade transcription failed, using local faster-whisper: {e}")
+
+    import tempfile
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
         tf.write(audio_bytes)
         tmp_path = tf.name

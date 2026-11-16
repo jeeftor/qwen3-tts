@@ -3,6 +3,8 @@
 Optimized Qwen3-TTS backend with model switching based on request.
 """
 
+import asyncio
+import concurrent.futures
 import logging
 import os
 import yaml
@@ -40,6 +42,24 @@ class OptimizedQwen3TTSBackend:
         self.device = None
         self.dtype = None
         self._voice_prompt_cache = {}  # cache_key -> VoiceClonePromptItem list
+        # Single worker thread: every blocking GPU call (model load, prompt
+        # build, generate, stream next()) runs here, so the event loop stays
+        # responsive and GPU access stays serialized.
+        self._gpu_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tts-gpu"
+        )
+
+    _DONE = object()
+
+    async def _bridge_sync_gen(self, gen):
+        """Yield items from a sync generator, running each next() on the GPU thread."""
+        loop = asyncio.get_running_loop()
+        it = iter(gen)
+        while True:
+            item = await loop.run_in_executor(self._gpu_executor, next, it, self._DONE)
+            if item is self._DONE:
+                return
+            yield item
 
     def _get_model_key_for_request(self, openai_model: str) -> str:
         """Map OpenAI model name to our model key."""
@@ -62,7 +82,14 @@ class OptimizedQwen3TTSBackend:
         return self.current_model_key
 
     async def _ensure_model_loaded(self, model_key: str) -> None:
-        """Load model if not already loaded."""
+        """Load model if not already loaded (runs on the GPU thread)."""
+        if self.current_model_key == model_key and self.model is not None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._gpu_executor, self._load_model_sync, model_key)
+
+    def _load_model_sync(self, model_key: str) -> None:
+        """Blocking model load/switch — always runs on the single GPU thread."""
         import torch
 
         if self.current_model_key == model_key and self.model is not None:
@@ -263,6 +290,12 @@ class OptimizedQwen3TTSBackend:
             model_key = MODEL_MAPPING.get(model, "0.6B-CustomVoice")
         await self._ensure_model_loaded(model_key)
 
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._gpu_executor, self._speech_sync, text, voice, language, instruct, speed
+        )
+
+    def _speech_sync(self, text, voice, language, instruct, speed):
         wavs, sr = self.model.generate_custom_voice(
             text=text,
             language=language,
@@ -311,15 +344,16 @@ class OptimizedQwen3TTSBackend:
         if voice.lower() in openai_mapping:
             voice_name = openai_mapping[voice.lower()]
 
-        for chunk, sr in self.model.stream_generate_custom_voice(
+        gen = self.model.stream_generate_custom_voice(
             text=text,
             speaker=voice_name,
             language=language,
             instruct=instruct,
             emit_every_frames=emit_every_frames,
             decode_window_frames=decode_window_frames,
-        ):
-            yield chunk, sr
+        )
+        async for item in self._bridge_sync_gen(gen):
+            yield item
 
 
     def _clone_model_key(self, model: Optional[str]) -> str:
@@ -344,6 +378,17 @@ class OptimizedQwen3TTSBackend:
         """Voice cloning requires Base model."""
         await self._ensure_model_loaded(self._clone_model_key(model))
 
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._gpu_executor,
+            self._voice_clone_sync,
+            text, ref_audio, ref_audio_sr, ref_text, language,
+            x_vector_only_mode, speed, cache_key,
+        )
+
+    def _voice_clone_sync(self, text, ref_audio, ref_audio_sr, ref_text,
+                          language, x_vector_only_mode, speed, cache_key):
+        """Blocking clone generation — runs on the single GPU thread."""
         import time as _time
 
         # Use cached voice prompt if available, otherwise compute and cache
@@ -392,6 +437,26 @@ class OptimizedQwen3TTSBackend:
                 pass
         return audio, sr
 
+    def _clone_prompt_sync(self, ref_audio, ref_audio_sr, ref_text,
+                           x_vector_only_mode, cache_key):
+        """Build (or fetch cached) voice clone prompt — GPU thread only."""
+        import time as _time
+        if cache_key and cache_key in self._voice_prompt_cache:
+            return self._voice_prompt_cache[cache_key]
+        t0 = _time.time()
+        prompt_items = self.model.create_voice_clone_prompt(
+            ref_audio=(ref_audio, ref_audio_sr),
+            ref_text=ref_text,
+            x_vector_only_mode=x_vector_only_mode,
+        )
+        t_prompt = _time.time() - t0
+        if cache_key:
+            self._voice_prompt_cache[cache_key] = prompt_items
+            logger.info(f"Voice prompt cached: '{cache_key}' (prompt_build={t_prompt:.3f}s)")
+        else:
+            logger.info(f"Voice prompt built (no cache): {t_prompt:.3f}s")
+        return prompt_items
+
     async def generate_voice_clone_streaming(
         self,
         text: str,
@@ -409,37 +474,26 @@ class OptimizedQwen3TTSBackend:
         """
         await self._ensure_model_loaded(self._clone_model_key(model))
 
-        import time as _time
-
+        loop = asyncio.get_running_loop()
         streaming_opts = self.config.get("optimization", {}).get("streaming", {})
         decode_window_frames = streaming_opts.get("decode_window_frames", 80)
         emit_every_frames = streaming_opts.get("emit_every_frames", 4)
 
-        # Build or retrieve cached voice clone prompt
-        if cache_key and cache_key in self._voice_prompt_cache:
-            prompt_items = self._voice_prompt_cache[cache_key]
-        else:
-            t0 = _time.time()
-            prompt_items = self.model.create_voice_clone_prompt(
-                ref_audio=(ref_audio, ref_audio_sr),
-                ref_text=ref_text,
-                x_vector_only_mode=x_vector_only_mode,
-            )
-            t_prompt = _time.time() - t0
-            if cache_key:
-                self._voice_prompt_cache[cache_key] = prompt_items
-                logger.info(f"Voice prompt cached: '{cache_key}' (prompt_build={t_prompt:.3f}s)")
-            else:
-                logger.info(f"Voice prompt built (no cache): {t_prompt:.3f}s")
+        prompt_items = await loop.run_in_executor(
+            self._gpu_executor,
+            self._clone_prompt_sync,
+            ref_audio, ref_audio_sr, ref_text, x_vector_only_mode, cache_key,
+        )
 
-        for chunk, sr in self.model.stream_generate_voice_clone(
+        gen = self.model.stream_generate_voice_clone(
             text=text,
             language=language,
             voice_clone_prompt=prompt_items,
             emit_every_frames=emit_every_frames,
             decode_window_frames=decode_window_frames,
-        ):
-            yield chunk, sr
+        )
+        async for item in self._bridge_sync_gen(gen):
+            yield item
 
     def get_backend_name(self) -> str:
         return "optimized"
