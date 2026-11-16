@@ -7,6 +7,8 @@ Handles conversion of raw audio to various formats (mp3, opus, aac, flac, wav, p
 
 import io
 import logging
+import math
+import os
 import struct
 from typing import Literal, Optional
 
@@ -18,6 +20,85 @@ AudioFormat = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
 
 # Default sample rate for Qwen3-TTS output
 DEFAULT_SAMPLE_RATE = 24000
+
+# --- Loudness normalization -------------------------------------------------
+# Model output level varies noticeably between voices/models/profiles
+# (~8 dB RMS spread measured across preset + clone voices). Normalize
+# toward a consistent target so generated clips don't jump in volume.
+# Disable with TTS_LOUDNESS_NORM=0; retune with TTS_LOUDNESS_TARGET_DBFS.
+_TARGET_DBFS = float(os.environ.get("TTS_LOUDNESS_TARGET_DBFS", "-20"))
+_ENABLED = os.environ.get("TTS_LOUDNESS_NORM", "1").strip().lower() not in ("0", "false", "off", "no")
+_SILENCE_RMS = 10 ** (-45 / 20)  # per-frame RMS floor; below this = silence
+_PEAK_CEILING = 0.95
+_MAX_GAIN = 10 ** (15 / 20)      # +15 dB boost ceiling
+_MIN_GAIN = 0.25                 # -12 dB attenuation floor
+
+
+class LoudnessNormalizer:
+    """Streaming loudness normalization (AGC).
+
+    An exponential moving average of per-chunk power steers gain toward
+    a target RMS. Chunks below the silence floor pass through raw and
+    don't perturb the estimate, so the gain converges on the utterance
+    level within ~a second and holds — preserving natural dynamics
+    while evening out between-generation level differences. Feed it
+    whole buffers or small stream chunks; behavior is equivalent.
+    """
+
+    def __init__(self, target_dbfs: Optional[float] = None, alpha: float = 0.25):
+        self.target_rms = 10 ** ((target_dbfs if target_dbfs is not None else _TARGET_DBFS) / 20)
+        self.alpha = alpha
+        self._avg_pwr: Optional[float] = None
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        if not _ENABLED or chunk is None or getattr(chunk, "size", 0) == 0:
+            return chunk
+        x = np.asarray(chunk, dtype=np.float32)
+        pwr = float(np.mean(x.astype(np.float64) ** 2))
+        if math.sqrt(pwr) < _SILENCE_RMS:
+            return x
+        if self._avg_pwr is None:
+            self._avg_pwr = pwr
+        else:
+            self._avg_pwr += self.alpha * (pwr - self._avg_pwr)
+        gain = min(max(self.target_rms / math.sqrt(self._avg_pwr), _MIN_GAIN), _MAX_GAIN)
+        out = x * gain
+        peak = float(np.max(np.abs(out)))
+        if peak > _PEAK_CEILING:
+            out = out * (_PEAK_CEILING / peak)
+        return out
+
+
+def normalize_loudness(
+    audio: np.ndarray,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    target_dbfs: Optional[float] = None,
+) -> np.ndarray:
+    """Whole-utterance loudness normalization for non-streaming paths.
+
+    Frames the buffer and averages power over voiced frames only, so
+    leading/trailing silence doesn't skew the estimate.
+    """
+    if not _ENABLED or audio is None or getattr(audio, "size", 0) == 0:
+        return audio
+    x = np.asarray(audio, dtype=np.float32)
+    frame = max(1, int(0.05 * sample_rate))
+    n_frames = x.size // frame
+    if n_frames == 0:
+        return LoudnessNormalizer(target_dbfs).process(x)
+    frames = x[: n_frames * frame].reshape(n_frames, frame)
+    pwrs = np.mean(frames.astype(np.float64) ** 2, axis=1)
+    voiced = pwrs[pwrs > _SILENCE_RMS ** 2]
+    if voiced.size == 0:
+        return x
+    speech_rms = math.sqrt(float(np.mean(voiced)))
+    target = 10 ** ((target_dbfs if target_dbfs is not None else _TARGET_DBFS) / 20)
+    gain = min(max(target / speech_rms, _MIN_GAIN), _MAX_GAIN)
+    out = x * gain
+    peak = float(np.max(np.abs(out)))
+    if peak > _PEAK_CEILING:
+        out = out * (_PEAK_CEILING / peak)
+    return out
 
 
 def get_content_type(audio_format: AudioFormat) -> str:

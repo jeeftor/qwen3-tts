@@ -30,7 +30,10 @@ from ..structures.schemas import (
     VoiceCloneCapabilities,
 )
 from ..services.text_processing import normalize_text
-from ..services.audio_encoding import encode_audio, get_content_type, DEFAULT_SAMPLE_RATE
+from ..services.audio_encoding import (
+    encode_audio, get_content_type, DEFAULT_SAMPLE_RATE,
+    LoudnessNormalizer, normalize_loudness,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -596,6 +599,7 @@ async def _create_speech_impl(
                     total_samples = 0
                     chunk_count = 0
                     sample_rate = 24000
+                    norm = LoudnessNormalizer()
                     async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
                         text=normalized_text,
                         ref_audio=ref_audio,
@@ -612,7 +616,7 @@ async def _create_speech_impl(
                             total_samples += len(pcm_chunk)
                             sample_rate = sr
                             chunk_count += 1
-                            yield encode_audio(pcm_chunk, fmt, sr)
+                            yield encode_audio(norm.process(pcm_chunk), fmt, sr)
                             await asyncio.sleep(0)
                     gen_time = time.time() - gen_start
                     audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
@@ -648,6 +652,7 @@ async def _create_speech_impl(
                 logger.info(f"Voice clone: Gen={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x")
 
                 fmt = request.response_format
+                audio = normalize_loudness(audio, sample_rate)
                 audio_bytes = encode_audio(audio, fmt, sample_rate)
                 content_type = get_content_type(fmt)
 
@@ -691,6 +696,7 @@ async def _create_speech_impl(
                     total_samples = 0
                     chunk_count = 0
                     sample_rate = 24000
+                    norm = LoudnessNormalizer()
                     async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
                         text=normalized_text,
                         ref_audio=ref_audio,
@@ -706,7 +712,7 @@ async def _create_speech_impl(
                             total_samples += len(pcm_chunk)
                             sample_rate = sr
                             chunk_count += 1
-                            yield encode_audio(pcm_chunk, fmt, sr)
+                            yield encode_audio(norm.process(pcm_chunk), fmt, sr)
                             await asyncio.sleep(0)
                     gen_time = time.time() - gen_start
                     audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
@@ -741,6 +747,7 @@ async def _create_speech_impl(
             rtf = gen_time / audio_dur if audio_dur > 0 else 0
             logger.info(f"Voice clone: Gen={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x")
 
+            audio = normalize_loudness(audio, sample_rate)
             audio_bytes = encode_audio(audio, request.response_format, sample_rate)
             content_type = get_content_type(request.response_format)
 
@@ -767,6 +774,7 @@ async def _create_speech_impl(
                 total_samples = 0
                 chunk_count = 0
                 sample_rate = 24000
+                norm = LoudnessNormalizer()
                 async for pcm_chunk, sr in backend.generate_speech_streaming(
                     text=normalized_text,
                     voice=voice_name,
@@ -780,7 +788,7 @@ async def _create_speech_impl(
                         total_samples += len(pcm_chunk)
                         sample_rate = sr
                         chunk_count += 1
-                        yield encode_audio(pcm_chunk, fmt, sr)
+                        yield encode_audio(norm.process(pcm_chunk), fmt, sr)
                         await asyncio.sleep(0)
                 gen_time = time.time() - gen_start
                 audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
@@ -817,6 +825,7 @@ async def _create_speech_impl(
             rtf = gen_time / audio_dur if audio_dur > 0 else 0
             logger.info(f"TTS: Gen={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x")
 
+            audio = normalize_loudness(audio, sample_rate)
             audio_bytes = encode_audio(audio, request.response_format, sample_rate)
             content_type = get_content_type(request.response_format)
 
@@ -1091,6 +1100,7 @@ async def _create_voice_clone_impl(
             model=request.model,
         )
 
+        audio = normalize_loudness(audio, sample_rate)
         audio_bytes = encode_audio(audio, request.response_format, sample_rate)
         content_type = get_content_type(request.response_format)
 
