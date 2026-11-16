@@ -526,8 +526,9 @@ async def create_speech(
     except DuplicateRequestError as e:
         raise HTTPException(status_code=409, detail=str(e))
     state = "done"
+    resp = None
     try:
-        return await _create_speech_impl(request, client_request)
+        resp = await _create_speech_impl(request, client_request)
     except asyncio.CancelledError:
         state = "cancelled"
         raise
@@ -535,7 +536,41 @@ async def create_speech(
         state = "error"
         raise
     finally:
-        await _queue.release(rid, state)
+        # Streaming responses do their GPU work while the body iterates —
+        # keep the slot until then (released inside _hold_queue_for_stream).
+        if not isinstance(resp, StreamingResponse):
+            await _queue.release(rid, state)
+    if isinstance(resp, StreamingResponse):
+        resp.body_iterator = _hold_queue_for_stream(resp.body_iterator, rid)
+    return resp
+
+
+async def _hold_queue_for_stream(iterator, request_id: str):
+    """Hold the SpeechQueue slot until a streaming response finishes.
+
+    _create_speech_impl returns a StreamingResponse whose async generator
+    performs the actual GPU generation during body iteration — after the
+    endpoint has returned. Wrap the iterator so the queue slot is released
+    on completion, error, or client disconnect instead of up front.
+    """
+    state = "done"
+    try:
+        async for chunk in iterator:
+            yield chunk
+    except asyncio.CancelledError:
+        state = "cancelled"
+        raise
+    except GeneratorExit:
+        state = "cancelled"
+        raise
+    except BaseException:
+        state = "error"
+        raise
+    finally:
+        try:
+            await _queue.release(request_id, state)
+        except BaseException:
+            pass
 
 
 async def _create_speech_impl(
