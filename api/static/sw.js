@@ -1,7 +1,7 @@
 // Qwen3-TTS Studio service worker — enables PWA install.
 // Strategy: navigations network-first (fresh UI after deploys),
 // /static/* cache-first, API/MCP/health always network (never cached).
-const CACHE = 'tts-studio-v1';
+const CACHE = 'tts-studio-v2';
 const PRECACHE = [
   '/',
   '/static/manifest.json',
