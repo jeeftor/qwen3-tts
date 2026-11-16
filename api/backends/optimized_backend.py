@@ -285,6 +285,13 @@ class OptimizedQwen3TTSBackend:
         """Switch to a different model."""
         await self._ensure_model_loaded(model_key)
 
+    def _customvoice_model_key(self, model: str) -> str:
+        """Resolve the CustomVoice model key for a request (with fallback)."""
+        model_key = self._get_model_key_for_request(model)
+        if self.config.get("models", {}).get(model_key, {}).get("type") != "customvoice":
+            model_key = MODEL_MAPPING.get(model, "0.6B-CustomVoice")
+        return model_key
+
     async def generate_speech(
         self,
         text: str,
@@ -295,9 +302,7 @@ class OptimizedQwen3TTSBackend:
         model: str = "tts-1",
     ) -> Tuple[np.ndarray, int]:
         """Generate speech, switching model if needed."""
-        model_key = self._get_model_key_for_request(model)
-        if self.config.get("models", {}).get(model_key, {}).get("type") != "customvoice":
-            model_key = MODEL_MAPPING.get(model, "0.6B-CustomVoice")
+        model_key = self._customvoice_model_key(model)
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -339,26 +344,18 @@ class OptimizedQwen3TTSBackend:
         Yields (pcm_chunk, sample_rate) tuples as audio is generated.
         Uses dffdeeq's stream_generate_pcm under the hood.
         """
-        model_key = self._get_model_key_for_request(model)
-        if self.config.get("models", {}).get(model_key, {}).get("type") != "customvoice":
-            model_key = MODEL_MAPPING.get(model, "0.6B-CustomVoice")
+        model_key = self._customvoice_model_key(model)
 
         streaming_opts = self.config.get("optimization", {}).get("streaming", {})
         decode_window_frames = streaming_opts.get("decode_window_frames", 80)
         emit_every_frames = streaming_opts.get("emit_every_frames", 4)
 
-        voice_name = voice
-        openai_mapping = {
-            "alloy": "Vivian", "echo": "Ryan", "fable": "Sophia",
-            "nova": "Isabella", "onyx": "Evan", "shimmer": "Lily",
-        }
-        if voice.lower() in openai_mapping:
-            voice_name = openai_mapping[voice.lower()]
-
+        # Voice names arrive already resolved — the router's get_voice_name
+        # owns OpenAI-alias mapping (VOICE_MAPPING); don't remap here.
         loop = asyncio.get_running_loop()
         gen = await loop.run_in_executor(
             self._gpu_executor, self._speech_stream_setup_sync,
-            model_key, text, voice_name, language, instruct,
+            model_key, text, voice, language, instruct,
             decode_window_frames, emit_every_frames,
         )
         async for item in self._bridge_sync_gen(gen):

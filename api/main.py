@@ -198,6 +198,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Compress text responses (studio.html, JSON) — audio formats are already
+# compressed/binary and gzip skips them via content-type anyway.
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 # Include routers
 from .routers.openai_compatible import router as openai_router
 app.include_router(openai_router, prefix="/v1")

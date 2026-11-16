@@ -489,6 +489,7 @@ async def generate_speech(
     language: str = "Auto",
     instruct: Optional[str] = None,
     speed: float = 1.0,
+    model: str = "tts-1",
 ) -> tuple[np.ndarray, int]:
     """Generate speech from text using the configured TTS backend."""
     backend = await get_tts_backend()
@@ -501,6 +502,7 @@ async def generate_speech(
             language=language,
             instruct=instruct,
             speed=speed,
+            model=model,
         )
         return audio, sr
     except Exception as e:
@@ -573,6 +575,99 @@ async def _hold_queue_for_stream(iterator, request_id: str):
             pass
 
 
+# Only headerless formats can be chunk-encoded on the fly — compressed
+# formats go through pydub/ffmpeg per call, which per-chunk would spawn a
+# subprocess every ~0.7s and produce malformed concatenated output.
+_STREAM_FORMATS = {"wav", "pcm"}
+
+
+def _pcm_stream_response(pcm_aiter, response_format: str, label: str,
+                         disposition: str = "attachment") -> StreamingResponse:
+    """Wrap a (pcm_chunk, sr) async iterator as a loudness-normalized stream.
+
+    Tracks first-byte/gen timing for the RTF log line. wav maps to headerless
+    pcm since stream chunks carry no container headers.
+    """
+    fmt = "pcm" if response_format == "wav" else response_format
+
+    async def stream():
+        gen_start = time.time()
+        first_chunk_time = None
+        total_samples = 0
+        chunk_count = 0
+        sample_rate = DEFAULT_SAMPLE_RATE
+        norm = LoudnessNormalizer()
+        async for pcm_chunk, sr in pcm_aiter:
+            if pcm_chunk is not None and len(pcm_chunk) > 0:
+                if first_chunk_time is None:
+                    first_chunk_time = time.time() - gen_start
+                total_samples += len(pcm_chunk)
+                sample_rate = sr
+                chunk_count += 1
+                yield encode_audio(norm.process(pcm_chunk), fmt, sr)
+                await asyncio.sleep(0)
+        gen_time = time.time() - gen_start
+        audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
+        rtf = gen_time / audio_dur if audio_dur > 0 else 0
+        logger.info(
+            f"{label}: First-Byte={first_chunk_time:.2f}s Gesamt={gen_time:.2f}s "
+            f"Audio={audio_dur:.2f}s RTF={rtf:.2f}x Chunks={chunk_count}")
+
+    return StreamingResponse(
+        stream(),
+        media_type=get_content_type(fmt),
+        headers={
+            "Content-Disposition": f"{disposition}; filename=speech.{fmt}",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+def _speech_response(audio: np.ndarray, sample_rate: int, response_format: str,
+                     disposition: str = "attachment",
+                     filename: Optional[str] = None) -> Response:
+    """Whole-buffer speech response: loudness-normalize, encode, respond."""
+    audio = normalize_loudness(audio, sample_rate)
+    audio_bytes = encode_audio(audio, response_format, sample_rate)
+    return Response(
+        content=audio_bytes,
+        media_type=get_content_type(response_format),
+        headers={
+            "Content-Disposition": f"{disposition}; filename={filename or 'speech'}.{response_format}",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+def _log_gen_stats(label: str, gen_start: float, audio: np.ndarray,
+                   sample_rate: int) -> None:
+    gen_time = time.time() - gen_start
+    audio_dur = len(audio) / sample_rate if sample_rate > 0 else 0
+    rtf = gen_time / audio_dur if audio_dur > 0 else 0
+    logger.info(f"{label}: Gen={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x")
+
+
+def _load_ref_audio_array(audio_bytes: bytes):
+    """Decode audio bytes to (float32 mono array, sample_rate)."""
+    audio, sr = sf.read(io.BytesIO(audio_bytes))
+    if len(audio.shape) > 1:
+        audio = audio.mean(axis=1)
+    return audio.astype(np.float32), sr
+
+
+_lemonade_client = None
+
+
+def _lemonade_http():
+    """Shared httpx client for Lemonade calls (created lazily, lives for
+    the app lifetime — AsyncClient is designed for reuse)."""
+    global _lemonade_client
+    if _lemonade_client is None:
+        import httpx
+        _lemonade_client = httpx.AsyncClient(timeout=120)
+    return _lemonade_client
+
+
 async def _create_speech_impl(
     request: OpenAISpeechRequest,
     client_request: Request,
@@ -586,6 +681,17 @@ async def _create_speech_impl(
             detail={
                 "error": "invalid_model",
                 "message": f"Unsupported model: {request.model}. Supported: {list(MODEL_MAPPING.keys())}",
+                "type": "invalid_request_error",
+            },
+        )
+
+    if request.stream and request.response_format not in _STREAM_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_response_format",
+                "message": f"Streaming only supports wav/pcm (got '{request.response_format}'). "
+                           "Compressed formats are whole-file encodes — retry with stream=false.",
                 "type": "invalid_request_error",
             },
         )
@@ -648,20 +754,8 @@ async def _create_speech_impl(
             logger.info(f"Voice profile '{profile['name']}': lang={clone_lang}, xvec_only={profile['x_vector_only_mode']}, stream={request.stream}")
 
             if request.stream:
-                # True streaming: yield PCM chunks as model generates them
-                fmt = request.response_format
-                if fmt == "wav":
-                    fmt = "pcm"
-                content_type = get_content_type(fmt)
-
-                async def clone_audio_stream():
-                    gen_start = time.time()
-                    first_chunk_time = None
-                    total_samples = 0
-                    chunk_count = 0
-                    sample_rate = 24000
-                    norm = LoudnessNormalizer()
-                    async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
+                return _pcm_stream_response(
+                    backend.generate_voice_clone_streaming(
                         text=normalized_text,
                         ref_audio=ref_audio,
                         ref_audio_sr=ref_sr,
@@ -670,95 +764,42 @@ async def _create_speech_impl(
                         x_vector_only_mode=profile["x_vector_only_mode"],
                         cache_key=profile_name,
                         model=request.model,
-                    ):
-                        if pcm_chunk is not None and len(pcm_chunk) > 0:
-                            if first_chunk_time is None:
-                                first_chunk_time = time.time() - gen_start
-                            total_samples += len(pcm_chunk)
-                            sample_rate = sr
-                            chunk_count += 1
-                            yield encode_audio(norm.process(pcm_chunk), fmt, sr)
-                            await asyncio.sleep(0)
-                    gen_time = time.time() - gen_start
-                    audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
-                    rtf = gen_time / audio_dur if audio_dur > 0 else 0
-                    logger.info(f"Voice clone stream: First-Byte={first_chunk_time:.2f}s Gesamt={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x Chunks={chunk_count}")
-
-                return StreamingResponse(
-                    clone_audio_stream(),
-                    media_type=content_type,
-                    headers={
-                        "Content-Disposition": f"inline; filename=speech.{fmt}",
-                        "Cache-Control": "no-cache",
-                    },
+                    ),
+                    request.response_format, "Voice clone stream", disposition="inline",
                 )
-            else:
-                # Non-streaming: generate all audio, then send (better RTF)
-                gen_start = time.time()
-                audio, sample_rate = await backend.generate_voice_clone(
-                    text=normalized_text,
-                    ref_audio=ref_audio,
-                    ref_audio_sr=ref_sr,
-                    ref_text=profile["ref_text"] or None,
-                    language=clone_lang,
-                    x_vector_only_mode=profile["x_vector_only_mode"],
-                    speed=request.speed,
-                    cache_key=profile_name,
-                    model=request.model,
-                )
-                gen_time = time.time() - gen_start
 
-                audio_dur = len(audio) / sample_rate if sample_rate > 0 else 0
-                rtf = gen_time / audio_dur if audio_dur > 0 else 0
-                logger.info(f"Voice clone: Gen={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x")
-
-                fmt = request.response_format
-                audio = normalize_loudness(audio, sample_rate)
-                audio_bytes = encode_audio(audio, fmt, sample_rate)
-                content_type = get_content_type(fmt)
-
-                async def send_audio():
-                    for i in range(0, len(audio_bytes), 4096):
-                        yield audio_bytes[i:i + 4096]
-
-                return StreamingResponse(
-                    send_audio(),
-                    media_type=content_type,
-                    headers={
-                        "Content-Disposition": f"inline; filename=speech.{fmt}",
-                        "Cache-Control": "no-cache",
-                    },
-                )
+            # Non-streaming: generate all audio, then send (better RTF)
+            gen_start = time.time()
+            audio, sample_rate = await backend.generate_voice_clone(
+                text=normalized_text,
+                ref_audio=ref_audio,
+                ref_audio_sr=ref_sr,
+                ref_text=profile["ref_text"] or None,
+                language=clone_lang,
+                x_vector_only_mode=profile["x_vector_only_mode"],
+                speed=request.speed,
+                cache_key=profile_name,
+                model=request.model,
+            )
+            _log_gen_stats("Voice clone", gen_start, audio, sample_rate)
+            return _speech_response(audio, sample_rate, request.response_format,
+                                    disposition="inline")
 
         # Voice cloning: task_type=Base with ref_audio (Voice Studio)
         if request.task_type == "Base" and request.ref_audio:
             backend = await get_tts_backend()
 
-            ref_audio_data = request.ref_audio
-            if ref_audio_data.startswith("data:"):
-                ref_audio_data = ref_audio_data.split(",", 1)[1]
-            audio_bytes_raw = base64.b64decode(ref_audio_data)
-            audio_buffer = io.BytesIO(audio_bytes_raw)
-            ref_audio, ref_sr = sf.read(audio_buffer)
-            if len(ref_audio.shape) > 1:
-                ref_audio = ref_audio.mean(axis=1)
-            ref_audio = ref_audio.astype(np.float32)
+            try:
+                ref_audio, ref_sr = _load_ref_audio_array(_decode_ref_audio(request.ref_audio))
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "invalid_audio", "message": f"Failed to decode reference audio: {e}", "type": "invalid_request_error"},
+                )
 
             if request.stream:
-                # True streaming: yield PCM chunks as model generates them
-                fmt = request.response_format
-                if fmt == "wav":
-                    fmt = "pcm"
-                content_type = get_content_type(fmt)
-
-                async def clone_ref_stream():
-                    gen_start = time.time()
-                    first_chunk_time = None
-                    total_samples = 0
-                    chunk_count = 0
-                    sample_rate = 24000
-                    norm = LoudnessNormalizer()
-                    async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
+                return _pcm_stream_response(
+                    backend.generate_voice_clone_streaming(
                         text=normalized_text,
                         ref_audio=ref_audio,
                         ref_audio_sr=ref_sr,
@@ -766,27 +807,8 @@ async def _create_speech_impl(
                         language=language,
                         x_vector_only_mode=request.x_vector_only_mode or False,
                         model=request.model,
-                    ):
-                        if pcm_chunk is not None and len(pcm_chunk) > 0:
-                            if first_chunk_time is None:
-                                first_chunk_time = time.time() - gen_start
-                            total_samples += len(pcm_chunk)
-                            sample_rate = sr
-                            chunk_count += 1
-                            yield encode_audio(norm.process(pcm_chunk), fmt, sr)
-                            await asyncio.sleep(0)
-                    gen_time = time.time() - gen_start
-                    audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
-                    rtf = gen_time / audio_dur if audio_dur > 0 else 0
-                    logger.info(f"Voice clone stream: First-Byte={first_chunk_time:.2f}s Gesamt={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x Chunks={chunk_count}")
-
-                return StreamingResponse(
-                    clone_ref_stream(),
-                    media_type=content_type,
-                    headers={
-                        "Content-Disposition": f"inline; filename=speech.{fmt}",
-                        "Cache-Control": "no-cache",
-                    },
+                    ),
+                    request.response_format, "Voice clone stream", disposition="inline",
                 )
 
             logger.info(f"Voice clone: lang={language}, ref_text={request.ref_text is not None}, xvec_only={request.x_vector_only_mode}")
@@ -802,100 +824,37 @@ async def _create_speech_impl(
                 speed=request.speed,
                 model=request.model,
             )
-            gen_time = time.time() - gen_start
-
-            audio_dur = len(audio) / sample_rate if sample_rate > 0 else 0
-            rtf = gen_time / audio_dur if audio_dur > 0 else 0
-            logger.info(f"Voice clone: Gen={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x")
-
-            audio = normalize_loudness(audio, sample_rate)
-            audio_bytes = encode_audio(audio, request.response_format, sample_rate)
-            content_type = get_content_type(request.response_format)
-
-            return Response(
-                content=audio_bytes,
-                media_type=content_type,
-                headers={
-                    "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
-                    "Cache-Control": "no-cache",
-                },
-            )
+            _log_gen_stats("Voice clone", gen_start, audio, sample_rate)
+            return _speech_response(audio, sample_rate, request.response_format,
+                                    disposition="attachment")
 
         if request.stream:
             backend = await get_tts_backend()
             voice_name = get_voice_name(request.voice)
-            fmt = request.response_format
-            if fmt == "wav":
-                fmt = "pcm"
-            content_type = get_content_type(fmt)
-
-            async def audio_stream():
-                gen_start = time.time()
-                first_chunk_time = None
-                total_samples = 0
-                chunk_count = 0
-                sample_rate = 24000
-                norm = LoudnessNormalizer()
-                async for pcm_chunk, sr in backend.generate_speech_streaming(
+            return _pcm_stream_response(
+                backend.generate_speech_streaming(
                     text=normalized_text,
                     voice=voice_name,
                     language=language,
                     instruct=request.instruct,
                     model=request.model,
-                ):
-                    if pcm_chunk is not None and len(pcm_chunk) > 0:
-                        if first_chunk_time is None:
-                            first_chunk_time = time.time() - gen_start
-                        total_samples += len(pcm_chunk)
-                        sample_rate = sr
-                        chunk_count += 1
-                        yield encode_audio(norm.process(pcm_chunk), fmt, sr)
-                        await asyncio.sleep(0)
-                gen_time = time.time() - gen_start
-                audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
-                rtf = gen_time / audio_dur if audio_dur > 0 else 0
-                logger.info(f"TTS stream: First-Byte={first_chunk_time:.2f}s Gesamt={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x Chunks={chunk_count}")
-
-            return StreamingResponse(
-                audio_stream(),
-                media_type=content_type,
-                headers={
-                    "Content-Disposition": f"attachment; filename=speech.{fmt}",
-                    "Cache-Control": "no-cache",
-                },
+                ),
+                request.response_format, "TTS stream", disposition="attachment",
             )
-        else:
-            # Non-streaming: backend runs GPU work on its own thread, event loop stays free
-            gen_start = time.time()
-            audio, sample_rate = await generate_speech(
-                text=normalized_text,
-                voice=request.voice,
-                language=language,
-                instruct=request.instruct,
-                speed=request.speed,
-            )
-            gen_time = time.time() - gen_start
 
-            audio_dur = len(audio) / sample_rate if sample_rate > 0 else 0
-            rtf = gen_time / audio_dur if audio_dur > 0 else 0
-            logger.info(f"TTS: Gen={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x")
-
-            audio = normalize_loudness(audio, sample_rate)
-            audio_bytes = encode_audio(audio, request.response_format, sample_rate)
-            content_type = get_content_type(request.response_format)
-
-            async def send_audio():
-                for i in range(0, len(audio_bytes), 4096):
-                    yield audio_bytes[i:i + 4096]
-
-            return StreamingResponse(
-                send_audio(),
-                media_type=content_type,
-                headers={
-                    "Content-Disposition": f"inline; filename=speech.{request.response_format}",
-                    "Cache-Control": "no-cache",
-                },
-            )
+        # Non-streaming: backend runs GPU work on its own thread, event loop stays free
+        gen_start = time.time()
+        audio, sample_rate = await generate_speech(
+            text=normalized_text,
+            voice=request.voice,
+            language=language,
+            instruct=request.instruct,
+            speed=request.speed,
+            model=request.model,
+        )
+        _log_gen_stats("TTS", gen_start, audio, sample_rate)
+        return _speech_response(audio, sample_rate, request.response_format,
+                                disposition="inline")
 
     except HTTPException:
         raise
@@ -1125,7 +1084,7 @@ async def _create_voice_clone_impl(
             )
 
         try:
-            audio_bytes = base64.b64decode(request.ref_audio)
+            audio_bytes = _decode_ref_audio(request.ref_audio)
         except Exception as e:
             raise HTTPException(
                 status_code=400,
@@ -1133,11 +1092,7 @@ async def _create_voice_clone_impl(
             )
 
         try:
-            audio_buffer = io.BytesIO(audio_bytes)
-            ref_audio, ref_sr = sf.read(audio_buffer)
-            if len(ref_audio.shape) > 1:
-                ref_audio = ref_audio.mean(axis=1)
-            ref_audio = ref_audio.astype(np.float32)
+            ref_audio, ref_sr = _load_ref_audio_array(audio_bytes)
         except Exception as e:
             raise HTTPException(
                 status_code=400,
@@ -1155,15 +1110,8 @@ async def _create_voice_clone_impl(
             model=request.model,
         )
 
-        audio = normalize_loudness(audio, sample_rate)
-        audio_bytes = encode_audio(audio, request.response_format, sample_rate)
-        content_type = get_content_type(request.response_format)
-
-        return Response(
-            content=audio_bytes,
-            media_type=content_type,
-            headers={"Content-Disposition": f"attachment; filename=voice_clone.{request.response_format}", "Cache-Control": "no-cache"},
-        )
+        return _speech_response(audio, sample_rate, request.response_format,
+                                disposition="attachment", filename="voice_clone")
 
     except HTTPException:
         raise
@@ -1433,15 +1381,14 @@ async def transcribe_audio(body: dict):
     lemonade_url = os.environ.get("LEMONADE_URL", "").rstrip("/")
     if lemonade_url:
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    f"{lemonade_url}/v1/audio/transcriptions",
-                    files={"file": (f"audio{suffix}", audio_bytes, mime)},
-                    data={"model": os.environ.get("LEMONADE_TRANSCRIBE_MODEL", "Whisper-Large-v3-Turbo")},
-                )
-                resp.raise_for_status()
-                result = resp.json()
+            client = _lemonade_http()
+            resp = await client.post(
+                f"{lemonade_url}/v1/audio/transcriptions",
+                files={"file": (f"audio{suffix}", audio_bytes, mime)},
+                data={"model": os.environ.get("LEMONADE_TRANSCRIBE_MODEL", "Whisper-Large-v3-Turbo")},
+            )
+            resp.raise_for_status()
+            result = resp.json()
             text = (result.get("text") or "").strip()
             if text:
                 return {"text": text, "segments": result.get("segments") or [], "language": result.get("language")}

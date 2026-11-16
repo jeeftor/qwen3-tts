@@ -34,6 +34,16 @@ _MAX_GAIN = 10 ** (15 / 20)      # +15 dB boost ceiling
 _MIN_GAIN = 0.25                 # -12 dB attenuation floor
 
 
+def _apply_gain(x: np.ndarray, gain: float) -> np.ndarray:
+    """Scale by gain with a 0.95 peak ceiling."""
+    out = x * gain
+    if out.size:
+        peak = float(np.max(np.abs(out)))
+        if peak > _PEAK_CEILING:
+            out = out * (_PEAK_CEILING / peak)
+    return out
+
+
 class LoudnessNormalizer:
     """Streaming loudness normalization (AGC).
 
@@ -62,11 +72,7 @@ class LoudnessNormalizer:
         else:
             self._avg_pwr += self.alpha * (pwr - self._avg_pwr)
         gain = min(max(self.target_rms / math.sqrt(self._avg_pwr), _MIN_GAIN), _MAX_GAIN)
-        out = x * gain
-        peak = float(np.max(np.abs(out)))
-        if peak > _PEAK_CEILING:
-            out = out * (_PEAK_CEILING / peak)
-        return out
+        return _apply_gain(x, gain)
 
 
 def normalize_loudness(
@@ -94,11 +100,7 @@ def normalize_loudness(
     speech_rms = math.sqrt(float(np.mean(voiced)))
     target = 10 ** ((target_dbfs if target_dbfs is not None else _TARGET_DBFS) / 20)
     gain = min(max(target / speech_rms, _MIN_GAIN), _MAX_GAIN)
-    out = x * gain
-    peak = float(np.max(np.abs(out)))
-    if peak > _PEAK_CEILING:
-        out = out * (_PEAK_CEILING / peak)
-    return out
+    return _apply_gain(x, gain)
 
 
 def get_content_type(audio_format: AudioFormat) -> str:
@@ -112,6 +114,17 @@ def get_content_type(audio_format: AudioFormat) -> str:
         "pcm": "audio/pcm",
     }
     return content_types.get(audio_format, f"audio/{audio_format}")
+
+
+def _float_to_int16(audio: np.ndarray) -> np.ndarray:
+    """float audio -> int16 PCM, peak-normalizing anything above full scale."""
+    if audio.dtype != np.float32:
+        audio = audio.astype(np.float32)
+    if audio.size:
+        max_val = np.max(np.abs(audio))
+        if max_val > 1.0:
+            audio = audio / max_val
+    return (audio * 32767).astype(np.int16)
 
 
 def convert_to_wav(
@@ -132,18 +145,9 @@ def convert_to_wav(
     Returns:
         WAV file bytes
     """
-    # Ensure audio is float32
-    if audio.dtype != np.float32:
-        audio = audio.astype(np.float32)
-    
-    # Normalize if needed
-    max_val = np.max(np.abs(audio))
-    if max_val > 1.0:
-        audio = audio / max_val
-    
     # Convert to int16
-    audio_int16 = (audio * 32767).astype(np.int16)
-    
+    audio_int16 = _float_to_int16(audio)
+
     # Create WAV header
     num_samples = len(audio_int16)
     bytes_per_sample = bits_per_sample // 8
@@ -190,18 +194,9 @@ def convert_to_pcm(
     Returns:
         Raw PCM bytes
     """
-    # Ensure audio is float32
-    if audio.dtype != np.float32:
-        audio = audio.astype(np.float32)
-    
-    # Normalize if needed
-    max_val = np.max(np.abs(audio))
-    if max_val > 1.0:
-        audio = audio / max_val
-    
     # Convert to int16
-    audio_int16 = (audio * 32767).astype(np.int16)
-    
+    audio_int16 = _float_to_int16(audio)
+
     return audio_int16.tobytes()
 
 
