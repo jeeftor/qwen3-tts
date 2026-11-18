@@ -436,8 +436,6 @@ MODEL_MAPPING = {
     # direct config.yaml model keys — full checkpoint selection
     "0.6B-Base": "qwen3-tts",
     "1.7B-Base": "qwen3-tts",
-    "0.6B-CustomVoice": "qwen3-tts",
-    "1.7B-CustomVoice": "qwen3-tts",
 }
 
 # Add language-specific model mappings
@@ -956,15 +954,6 @@ async def get_model(model_id: str):
 @router.get("/voices")
 async def list_voices():
     """List all available voices for text-to-speech."""
-    openai_voices = [
-        VoiceInfo(id="alloy", name="Alloy", description="OpenAI-compatible voice (maps to Vivian)"),
-        VoiceInfo(id="echo", name="Echo", description="OpenAI-compatible voice (maps to Ryan)"),
-        VoiceInfo(id="fable", name="Fable", description="OpenAI-compatible voice (maps to Serena)"),
-        VoiceInfo(id="nova", name="Nova", description="OpenAI-compatible voice (maps to Aiden)"),
-        VoiceInfo(id="onyx", name="Onyx", description="OpenAI-compatible voice (maps to Eric)"),
-        VoiceInfo(id="shimmer", name="Shimmer", description="OpenAI-compatible voice (maps to Dylan)"),
-    ]
-
     default_languages = ["English", "Chinese", "Japanese", "Korean", "German", "French", "Spanish", "Russian", "Portuguese", "Italian"]
 
     try:
@@ -1006,14 +995,14 @@ async def list_voices():
                     pass
 
         return {
-            "voices": voices + clone_voices + [v.model_dump() for v in openai_voices],
+            "voices": voices + clone_voices,
             "languages": languages if languages else default_languages,
         }
 
     except Exception as e:
         logger.warning(f"Could not get voices from backend: {e}")
         return {
-            "voices": [v.model_dump() for v in openai_voices],
+            "voices": [],
             "languages": default_languages,
         }
 

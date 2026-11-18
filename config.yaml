@@ -4,15 +4,9 @@ models:
   0.6B-Base:
     hf_id: Qwen/Qwen3-TTS-12Hz-0.6B-Base
     type: base
-  0.6B-CustomVoice:
-    hf_id: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
-    type: customvoice
   1.7B-Base:
     hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     type: base
-  1.7B-CustomVoice:
-    hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-    type: customvoice
 optimization:
   attention: flash_attention_2
   compile_mode: default
@@ -26,22 +20,4 @@ optimization:
 server:
   host: 0.0.0.0
   port: 8880
-voices:
-- language: Chinese
-  name: Vivian
-- language: Chinese
-  name: Serena
-- language: Chinese
-  name: Uncle_Fu
-- language: Chinese
-  name: Dylan
-- language: Chinese
-  name: Eric
-- language: English
-  name: Ryan
-- language: Japanese
-  name: Aiden
-- language: Korean
-  name: Ono_Anna
-- language: English
-  name: Sohee
+# Clone-only deployment: no CustomVoice models, no preset voices.

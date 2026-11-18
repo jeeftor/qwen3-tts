@@ -411,8 +411,6 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
               <button data-v="" class="on" title="Pick automatically from the voice">Auto</button>
               <button data-v="0.6B-Base" title="Qwen3-TTS-12Hz-0.6B-Base — fastest clone">0.6B Clone</button>
               <button data-v="1.7B-Base" title="Qwen3-TTS-12Hz-1.7B-Base — best clone quality">1.7B Clone</button>
-              <button data-v="0.6B-CustomVoice" title="Qwen3-TTS-12Hz-0.6B-CustomVoice — preset voices">0.6B Preset</button>
-              <button data-v="1.7B-CustomVoice" title="Qwen3-TTS-12Hz-1.7B-CustomVoice — preset voices">1.7B Preset</button>
             </div>
           </div>
           <div class="grid c2" style="margin-top:14px">
@@ -432,7 +430,7 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
           </div>
           <div id="styleBox">
           <div style="margin-top:10px">
-            <label for="gInstruct">Style instructions <span class="hint">(preset voices — click a vibe or let AI suggest)</span></label>
+            <label for="gInstruct">Style instructions <span class="hint">(unused — clone voices take style from reference audio)</span></label>
             <input type="text" id="gInstruct" placeholder="e.g. Calm, confident, slightly upbeat">
             <div class="chips" id="gChips">
               <button data-s="">✕ clear</button>
@@ -616,7 +614,7 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
         <tr><th>Field</th><th>Type</th><th>Notes</th></tr>
         <tr><td><code>input</code></td><td>string</td><td>Text to synthesize (required)</td></tr>
         <tr><td><code>voice</code></td><td>string</td><td>Preset name or <code>clone:&lt;profile&gt;</code></td></tr>
-        <tr><td><code>model</code></td><td>string</td><td><code>0.6B-Base</code> <code>1.7B-Base</code> <code>0.6B-CustomVoice</code> <code>1.7B-CustomVoice</code></td></tr>
+        <tr><td><code>model</code></td><td>string</td><td><code>0.6B-Base</code> <code>1.7B-Base</code> <code>tts-1</code> <code>tts-1-hd</code></td></tr>
         <tr><td><code>response_format</code></td><td>string</td><td><code>wav</code> <code>mp3</code> <code>flac</code> <code>ogg</code> <code>opus</code> <code>pcm</code></td></tr>
         <tr><td><code>stream</code></td><td>bool</td><td><code>true</code> → chunked PCM (client wraps WAV)</td></tr>
         <tr><td><code>speed</code></td><td>float</td><td>0.25–4.0 (non-streaming only)</td></tr>
@@ -635,7 +633,7 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
       <pre id="ex1"></pre>
       <div class="desc">Raw clone (audio + transcript inline):</div>
       <pre id="ex2"></pre>
-      <div class="note"><b>Preset vs Clone:</b> preset voices (Vivian, Serena…) are pre-trained speakers built into the CustomVoice models — pick a name, no audio needed. Clone voices (<code>clone:&lt;name&gt;</code>) are zero-shot clones from your reference audio via the Base models — different checkpoints, auto-selected by voice. Models swap on demand; first request per model pays ~5–30s load.</div>
+      <div class="note"><b>Clone voices:</b> <code>clone:&lt;name&gt;</code> voices are zero-shot clones from your reference audio via the Base models — auto-selected by voice. Models swap on demand and unload after 15min idle; first request per model pays ~5–30s load.</div>
       <div class="note">Models auto-swap on demand — first request per model pays load time (~5–30s). Saved <code>clone:</code> profiles cache the voice prompt → faster than raw <code>ref_audio</code>. Typical generation 10–30s (~3× realtime on 0.6B-Base). <code>stream:true</code> returns raw PCM chunks — concatenate and wrap in a WAV header client-side.</div>
     </div>
   </div>

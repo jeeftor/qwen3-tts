@@ -316,6 +316,11 @@ class OptimizedQwen3TTSBackend:
 
     def _customvoice_model_key(self, model: str) -> str:
         """Resolve the CustomVoice model key for a request (with fallback)."""
+        if not any(m.get("type") == "customvoice"
+                   for m in self.config.get("models", {}).values()):
+            raise ValueError(
+                "preset voices unavailable — no CustomVoice model configured; "
+                "use clone:<profile> instead")
         model_key = self._get_model_key_for_request(model)
         if self.config.get("models", {}).get(model_key, {}).get("type") != "customvoice":
             model_key = MODEL_MAPPING.get(model, "0.6B-CustomVoice")
