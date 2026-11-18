@@ -52,6 +52,13 @@ and [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streaming
   `GET /v1/queue` shows the whole board and `DELETE /v1/queue/{id}` cancels
   a still-queued request. Disconnecting while queued drops the ticket so it
   never burns a GPU slot. The Studio UI shows live queue position.
+- **Model lifecycle** — one TTS model is resident at a time (~4 GB VRAM).
+  `TTS_IDLE_UNLOAD_SECONDS` (default 900) auto-unloads after that many
+  seconds with zero requests, but only while the queue is empty. Manual
+  control: `GET /v1/model` (loaded model, VRAM, idle timer, queue),
+  `POST /v1/model/load` (`{"model": "1.7B-Base"}` or empty for default —
+  pre-warms on the GPU worker), `POST /v1/model/unload` (force-free now;
+  409s while the queue has active/pending work).
 - **MCP endpoint** — with the `mcp` package installed, a Model Context
   Protocol server is mounted at `/mcp/` (streamable HTTP). Tools:
   `generate_speech` (returns base64 audio, optional `save_clip`),
