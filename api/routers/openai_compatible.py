@@ -109,6 +109,10 @@ class SpeechQueue:
             # Explicitly cancelled via DELETE /v1/queue/{id} while queued.
             raise asyncio.CancelledError()
 
+    def busy(self) -> bool:
+        """True while any request holds or waits for a generation slot."""
+        return bool(self._pending or self._running)
+
     def _promote_locked(self) -> None:
         while len(self._running) < self.max_concurrent and self._pending:
             rid = self._pending.popleft()
@@ -542,9 +546,21 @@ async def create_speech(
         # keep the slot until then (released inside _hold_queue_for_stream).
         if not isinstance(resp, StreamingResponse):
             await _queue.release(rid, state)
+            _touch_backend_activity()
     if isinstance(resp, StreamingResponse):
         resp.body_iterator = _hold_queue_for_stream(resp.body_iterator, rid)
     return resp
+
+
+def _touch_backend_activity() -> None:
+    """Stamp GPU activity on the backend so idle-unload sees fresh work."""
+    try:
+        from ..backends import get_backend
+        b = get_backend()
+        if b is not None:
+            b.touch_gpu_activity()
+    except Exception:
+        pass
 
 
 async def _hold_queue_for_stream(iterator, request_id: str):
@@ -573,6 +589,7 @@ async def _hold_queue_for_stream(iterator, request_id: str):
             await _queue.release(request_id, state)
         except BaseException:
             pass
+        _touch_backend_activity()
 
 
 # Only headerless formats can be chunk-encoded on the fly — compressed

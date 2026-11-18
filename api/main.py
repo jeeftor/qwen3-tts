@@ -42,6 +42,7 @@ WORKERS = int(os.getenv("WORKERS", "1"))
 TTS_BACKEND = os.getenv("TTS_BACKEND", "official")
 TTS_WARMUP_ON_START = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true"
 GPU_KEEPALIVE_INTERVAL = int(os.getenv("GPU_KEEPALIVE_INTERVAL", "0"))
+TTS_IDLE_UNLOAD_SECONDS = float(os.getenv("TTS_IDLE_UNLOAD_SECONDS", "900"))
 
 # CORS configuration
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
@@ -128,6 +129,32 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"GPU keepalive setup failed: {e}")
 
+    # Idle model unload: release GPU memory when TTS sees no requests.
+    # Only fires while the speech queue is completely empty, and the unload
+    # itself runs on the backend's single GPU thread — it can never
+    # interleave with an in-flight generation.
+    idle_unload_task = None
+    if TTS_IDLE_UNLOAD_SECONDS > 0:
+        async def _idle_unload_loop():
+            from .backends import get_backend
+            from .routers.openai_compatible import _queue
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    b = get_backend()
+                    if b is None or getattr(b, "model", None) is None:
+                        continue
+                    if _queue.busy():
+                        continue
+                    if await b.unload_if_idle(TTS_IDLE_UNLOAD_SECONDS):
+                        logger.info(
+                            f"Idle unload: released model after "
+                            f"{TTS_IDLE_UNLOAD_SECONDS:.0f}s without requests")
+                except Exception as e:
+                    logger.warning(f"Idle unload check failed: {e}")
+        idle_unload_task = asyncio.create_task(_idle_unload_loop())
+        logger.info(f"Idle unload: model releases after {TTS_IDLE_UNLOAD_SECONDS:.0f}s idle")
+
     # MCP streamable-HTTP session manager (mounted sub-app lifespans don't
     # run, so the parent lifespan owns it — per MCP SDK docs pattern)
     mcp_ctx = None
@@ -150,6 +177,8 @@ async def lifespan(app: FastAPI):
         # Cleanup
         if keepalive_task:
             keepalive_task.cancel()
+        if idle_unload_task:
+            idle_unload_task.cancel()
         logger.info("Server shutting down...")
 
 

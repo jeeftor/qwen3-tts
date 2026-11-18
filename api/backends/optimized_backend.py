@@ -7,6 +7,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import time
 import yaml
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
@@ -42,6 +43,7 @@ class OptimizedQwen3TTSBackend:
         self.device = None
         self.dtype = None
         self._voice_prompt_cache = {}  # cache_key -> VoiceClonePromptItem list
+        self._last_gpu_activity = 0.0  # stamped on every GPU-thread task
         # Single worker thread: every blocking GPU call (model load, prompt
         # build, generate, stream next()) runs here, so the event loop stays
         # responsive and GPU access stays serialized.
@@ -98,10 +100,44 @@ class OptimizedQwen3TTSBackend:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(self._gpu_executor, self._load_model_sync, model_key)
 
+    def _unload_model_sync(self) -> None:
+        """Free the loaded model + prompt cache. Runs on the GPU thread."""
+        import torch
+        if self.model is None:
+            return
+        logger.info(f"Unloading {self.current_model_key}...")
+        if self._voice_prompt_cache:
+            logger.info(f"Clearing voice prompt cache ({len(self._voice_prompt_cache)} entries)")
+            self._voice_prompt_cache.clear()
+        del self.model
+        self.model = None
+        self.current_model_key = None
+        torch.cuda.empty_cache()
+
+    def touch_gpu_activity(self) -> None:
+        self._last_gpu_activity = time.time()
+
+    async def unload_if_idle(self, idle_seconds: float) -> bool:
+        """Unload the model if no GPU work ran within idle_seconds.
+
+        The check runs on the event loop; the unload itself is queued on the
+        single GPU thread, so it can never interleave with an in-flight
+        generate (each worker is one atomic executor task). Callers should
+        additionally verify the request queue is empty before calling.
+        """
+        if self.model is None:
+            return False
+        if time.time() - self._last_gpu_activity < idle_seconds:
+            return False
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._gpu_executor, self._unload_model_sync)
+        return True
+
     def _load_model_sync(self, model_key: str) -> None:
         """Blocking model load/switch — always runs on the single GPU thread."""
         import torch
 
+        self._last_gpu_activity = time.time()
         if self.current_model_key == model_key and self.model is not None:
             return
 
@@ -112,14 +148,7 @@ class OptimizedQwen3TTSBackend:
         hf_id = model_info["hf_id"]
 
         # Unload previous model
-        if self.model is not None:
-            logger.info(f"Unloading {self.current_model_key}...")
-            if self._voice_prompt_cache:
-                logger.info(f"Clearing voice prompt cache ({len(self._voice_prompt_cache)} entries)")
-                self._voice_prompt_cache.clear()
-            del self.model
-            self.model = None
-            torch.cuda.empty_cache()
+        self._unload_model_sync()
 
         logger.info(f"Loading {model_key} ({hf_id})...")
 
