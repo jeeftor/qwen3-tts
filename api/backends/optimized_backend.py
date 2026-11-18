@@ -567,4 +567,6 @@ class OptimizedQwen3TTSBackend:
             info["gpu_name"] = torch.cuda.get_device_name(0)
             props = torch.cuda.get_device_properties(0)
             info["vram_total"] = f"{props.total_memory / 1024**3:.1f} GB"
+            info["vram_used"] = f"{torch.cuda.memory_reserved(0) / 1024**3:.2f} GB"
+            info["vram_allocated"] = f"{torch.cuda.memory_allocated(0) / 1024**3:.2f} GB"
         return info

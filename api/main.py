@@ -354,6 +354,7 @@ async def health_check():
                 "gpu_name": device_info.get("gpu_name"),
                 "vram_total": device_info.get("vram_total"),
                 "vram_used": device_info.get("vram_used"),
+                "vram_allocated": device_info.get("vram_allocated"),
             },
             "version": "0.1.0",
         }
