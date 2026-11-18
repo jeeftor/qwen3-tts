@@ -133,6 +133,32 @@ class OptimizedQwen3TTSBackend:
         await loop.run_in_executor(self._gpu_executor, self._unload_model_sync)
         return True
 
+    async def unload_model(self) -> bool:
+        """Force-unload the resident model. Returns False if nothing loaded.
+
+        Runs on the single GPU thread like all model work. Callers should
+        verify the request queue is empty first — in-flight generations hold
+        their own model refs, but empty_cache mid-stream is still best avoided.
+        """
+        if self.model is None:
+            return False
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._gpu_executor, self._unload_model_sync)
+        return True
+
+    def get_model_status(self) -> dict:
+        """Resident-model status for the /v1/model endpoint."""
+        loaded = self.model is not None
+        return {
+            "loaded": loaded,
+            "model_key": self.current_model_key if loaded else None,
+            "model_id": self.get_model_id(),
+            "model_type": self.get_model_type() if loaded else None,
+            "idle_seconds": (
+                round(time.time() - self._last_gpu_activity, 1) if loaded else None
+            ),
+        }
+
     def _load_model_sync(self, model_key: str) -> None:
         """Blocking model load/switch — always runs on the single GPU thread."""
         import torch

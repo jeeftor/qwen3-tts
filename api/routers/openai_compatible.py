@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from ..structures.schemas import (
     OpenAISpeechRequest,
     ModelInfo,
+    ModelLoadRequest,
     VoiceInfo,
     VoiceCloneRequest,
     VoiceCloneCapabilities,
@@ -914,6 +915,95 @@ async def cancel_queue_request(request_id: str):
     if result == "running":
         raise HTTPException(status_code=409, detail={"error": "already_running", "message": "Request is already generating — cannot cancel in-flight GPU work"})
     return {"request_id": request_id, "state": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# Resident model management (load / status / unload)
+# ---------------------------------------------------------------------------
+
+@router.get("/model")
+async def model_status():
+    """What's resident in GPU memory: loaded model, VRAM, idle timer, queue."""
+    from ..backends import get_backend
+    b = get_backend()
+    board = _queue.status()
+    out = {
+        "backend": b.get_backend_name(),
+        "model_id": b.get_model_id(),
+        "loaded": b.get_model_id() != "not-loaded",
+        "device": b.get_device_info(),
+        "available_models": (
+            b.get_available_models() if hasattr(b, "get_available_models") else []
+        ),
+        "idle_unload_seconds": float(
+            os.environ.get("TTS_IDLE_UNLOAD_SECONDS", "900")),
+        "queue": {
+            "active_count": board["active_count"],
+            "queue_length": board["queue_length"],
+        },
+    }
+    get_status = getattr(b, "get_model_status", None)
+    if get_status is not None:
+        out.update(get_status())
+    return out
+
+
+@router.post("/model/load")
+async def model_load(req: ModelLoadRequest):
+    """Pre-load a model into GPU memory (warm-up). No-op if already loaded."""
+    from ..backends import get_backend
+    b = get_backend()
+    if not hasattr(b, "switch_model"):
+        raise HTTPException(
+            status_code=501,
+            detail={"error": "unsupported", "message": "Backend does not support explicit model load"},
+        )
+    available = b.get_available_models() if hasattr(b, "get_available_models") else []
+    key = req.model or getattr(b, "config", {}).get(
+        "default_model", available[0] if available else None)
+    if key not in available:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unknown_model",
+                "message": f"Unknown model '{key}'",
+                "available_models": available,
+            },
+        )
+    try:
+        await b.switch_model(key)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "load_failed", "message": str(e)},
+        )
+    _touch_backend_activity()
+    return {"loaded": True, "model": key, "model_id": b.get_model_id()}
+
+
+@router.post("/model/unload")
+async def model_unload():
+    """Force-unload the resident model now. Refuses (409) while the
+    generation queue has active or pending work — in-flight GPU tasks
+    always run to completion."""
+    from ..backends import get_backend
+    b = get_backend()
+    unload = getattr(b, "unload_model", None)
+    if unload is None:
+        raise HTTPException(
+            status_code=501,
+            detail={"error": "unsupported", "message": "Backend does not support explicit unload"},
+        )
+    if _queue.busy():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "busy",
+                "message": "Generation in progress — unload refused; retry when the queue drains",
+            },
+        )
+    unloaded = await unload()
+    return {"unloaded": unloaded, "model": None}
 
 
 @router.get("/models")

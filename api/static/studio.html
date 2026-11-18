@@ -603,6 +603,7 @@ button,a,.spkchip,.tagchip,.vcard,.recbtn,summary,.mtab{touch-action:manipulatio
         <tr><td><span class="mono">GET·POST·PUT·DELETE</span></td><td><code>/v1/clips</code></td><td>Saved clip library (+ <code>/{id}/audio</code>, <code>/stream.mp3</code>, <code>/play</code>)</td></tr>
         <tr><td><span class="mono">GET</span></td><td><code>/v1/speakers</code></td><td>Sonos/media players via Home Assistant</td></tr>
         <tr><td><span class="mono">GET·DELETE</span></td><td><code>/v1/queue</code> <code>/v1/queue/{id}</code></td><td>Generation queue — position, ETA, cancel queued</td></tr>
+        <tr><td><span class="mono">GET·POST</span></td><td><code>/v1/model</code> <code>/v1/model/load</code> <code>/v1/model/unload</code></td><td>Resident model — status, warm-up load, force unload</td></tr>
         <tr><td><span class="mono">POST</span></td><td><code>/mcp/</code></td><td>MCP endpoint (streamable HTTP) — tools: generate_speech, list_voices, list_clips, play_clip…</td></tr>
         <tr><td><span class="mono">GET</span></td><td><code>/health</code></td><td>Backend / model / device status</td></tr>
       </table>

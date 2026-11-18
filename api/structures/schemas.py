@@ -187,3 +187,12 @@ class VoiceCloneCapabilities(BaseModel):
         ...,
         description="Whether x-vector only mode is available.",
     )
+
+
+class ModelLoadRequest(BaseModel):
+    """Request schema for pre-loading a TTS model into GPU memory."""
+
+    model: Optional[str] = Field(
+        default=None,
+        description="Model key to load (e.g. '1.7B-Base'). Defaults to the configured default model.",
+    )
